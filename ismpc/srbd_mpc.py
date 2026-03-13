@@ -98,6 +98,18 @@ class SrbdMpc:
             p_stance_xy = current_state['rfoot']['pos'][3:5]
             p_stance_z  = current_state['rfoot']['pos'][5]
         
+        # Cost setup
+        cost = 0.0
+        
+        W_com_z = 5000.0                      # Weight for tracking the CoM height (important for stability)
+        W_vel = np.diag([10.0, 10.0, 10.0])   # Cost for chasing CoM velocity
+        W_quat = np.diag([100.0, 100.0, 100.0]) # Cost for maintaining the torso upright (penalizes X,Y,Z of the quaternion)
+        W_omega = np.diag([10.0, 10.0, 10.0]) # Cost for stopping rotations
+        W_force = np.eye(12) * 1e-4           # Minimum force for the motors
+        W_swing = 1000.0                      # Cost for tracking the desired footprint
+
+        h_ref = 0.72 # Reference height for the CoM for the HRP-4        
+        
         
         # Main loop
         for k in range(self.N): 
@@ -145,10 +157,32 @@ class SrbdMpc:
                 else:
                     self.opt.subject_to(self.U[0:6, k] == 0)
             
+            # Cost computation section (refer to the paper!)
+            # 1. Height tracking for the CoM
+            cost += W_com_z * (self.X[2, k + 1] - h_ref)**2
+            
+            # 2. Regularization terms
+            v_err = self.X[3:6, k+1] 
+            cost += cs.mtimes([v_err.T, W_vel, v_err])
+            
+            quat_err = self.X[7:10, k+1]
+            cost += cs.mtimes([quat_err.T, W_quat, quat_err])
+            
+            omega_err = self.X[10:13, k+1]
+            cost += cs.mtimes([omega_err.T, W_omega, omega_err])
+            
+            cost += cs.mtimes([self.U[:, k].T, W_force, self.U[:, k]]) # Minimizing effort
+                
         # K.C. for the leg
         self.apply_kinematic_constraints(t)
         
-        # Add here costs for tracking the desired trajectory and minimizing control effort
+        # Another cost term
+        # 3. Contact tracking
+        try:
+            next_step_target = self.footstep_planner.plan[current_step_index + 1]['pos'][3:5]
+        except IndexError:
+            next_step_target = self.footstep_planner.plan[current_step_index]['pos'][3:5]   
+        cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
         
         # Solve
         sol = self.opt.solve()
