@@ -3,12 +3,13 @@ import dartpy as dart
 import copy
 from utils import *
 import os
-import ismpc
+import srbd_mpc
 import footstep_planner
 import inverse_dynamics as id
 import filter
 import foot_trajectory_generator as ftg
 from logger import Logger
+from scipy.spatial.transform import Rotation
 
 class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
     def __init__(self, world, hrp4):
@@ -18,7 +19,6 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.time = 0
         self.params = {
             'g': 9.81,
-            'h': 0.72,
             'foot_size': 0.1,
             'step_height': 0.02,
             'ss_duration': 70,
@@ -28,14 +28,16 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             'µ': 0.5,
             'N': 100,
             'dof': self.hrp4.getNumDofs(),
+            'mass': self.hrp4.getMass()
         }
-        self.params['eta'] = np.sqrt(self.params['g'] / self.params['h'])
 
         # robot links
         self.lsole = hrp4.getBodyNode('l_sole')
         self.rsole = hrp4.getBodyNode('r_sole')
         self.torso = hrp4.getBodyNode('torso')
         self.base  = hrp4.getBodyNode('body')
+
+        self.params['inertia'] = self.base.getInertia().spatial()[3:, 3:]
 
         for i in range(hrp4.getNumJoints()):
             joint = hrp4.getJoint(i)
@@ -85,8 +87,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             self.params
             )
 
-        # initialize MPC controller
-        self.mpc = ismpc.Ismpc(
+        # initialize MPC controller (now SRBD!)
+        self.mpc = srbd_mpc.SrbdMpc(
             self.initial, 
             self.footstep_planner, 
             self.params
