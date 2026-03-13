@@ -19,7 +19,7 @@ class SrbdMpc:
         # variables for optimization problem
         self.opt = cs.Opti()
         self.X = self.opt.variable(13, self.N + 1) # pos, vel CoM, quaternion, angular vel
-        self.U = self.opt.variable(12, self.N) # forces and torques at the feet + flying foot coords
+        self.U = self.opt.variable(12, self.N) # forces and torques at the feet
         self.p_swing = self.opt.variable(2) # swing foot position in the world frame
         
         # optimization problem (The quaternion derivative and the total torque functions will be added later)
@@ -27,7 +27,7 @@ class SrbdMpc:
             x[3:6], # CoM velocity
             (1 / self.mass) * (u[0:3] + u[3:6] + u[6:9] + u[9:12]) + self.g, # CoM acceleration
             self.compute_quaternion_derivative(x[6:10], x[10:13]), # quaternion derivative
-            self.I_inv @ (self.compute_total_torque(x, u) - cs.cross(x[10:13], self.I @ x[10:13])) # angular acceleration
+            self.I_inv @ (self.compute_total_torque(x, u, p_contacts) - cs.cross(x[10:13], self.I @ x[10:13])) # angular acceleration
         )
         
         p_opts = {"expand": True}
@@ -50,8 +50,21 @@ class SrbdMpc:
         )
         return 0.5 * (E @ w)
 
-    def compute_total_torque(self, x, u):
+    def compute_total_torque(self, x, u, p_contacts):
+        com_pos = x[0:3]
+        total_torque = cs.vertcat(0.0, 0.0, 0.0)
         
+        # Iterating on the 4 contact points (2 feet with 2 contact points each)
+        for i in range(4):
+            f_i = u[i*3 : (i+1)*3]
+            p_i = p_contacts[i*3 : (i+1)*3]
+            
+            # lever length
+            r = p_i - com_pos
+            
+            # L_dot = r x f
+            total_torque += cs.cross(r, f_i)
+        return total_torque        
 
     def apply_kinematic_constraints(self, t):
         current_step_index = self.footstep_planner.get_step_index_at_time(t)
@@ -63,3 +76,103 @@ class SrbdMpc:
             (self.p_swing[0] - support_foot_pos[0])**2 + 
             (self.p_swing[1] - support_foot_pos[1])**2 <= L_max**2 
         )
+        
+    def compute_controls(self, current_state, t):
+        # Set initial state
+        x0 = cs.vertcat(
+            current_state['com']['pos'],
+            current_state['com']['vel'],
+            current_state['base']['quat'],
+            current_state['base']['omega']
+        )
+        self.opt.subject_to(self.X[:, 0] == x0)
+        
+        current_step_index = self.footstep_planner.get_step_index_at_time(t)
+        
+        # Stance calculation
+        current_support = self.footstep_planner.get_support_foot_at_time(t)
+        if current_support == 'lfoot':
+            p_stance_xy = current_state['lfoot']['pos'][3:5] 
+            p_stance_z  = current_state['lfoot']['pos'][5]
+        else:
+            p_stance_xy = current_state['rfoot']['pos'][3:5]
+            p_stance_z  = current_state['rfoot']['pos'][5]
+        
+        
+        # Main loop
+        for k in range(self.N): 
+            t_k = t + k * self.delta 
+            future_step_index = self.footstep_planner.get_step_index_at_time(t_k)
+            phase = self.footstep_planner.get_phase_at_time(t_k)
+            support_foot = self.footstep_planner.get_support_foot_at_time(t_k)
+            
+            # Foot stance
+            if future_step_index == current_step_index: 
+                # Now standing. Next step -> flight. At every time step feet are immobile
+                p_lfoot_k = current_state['lfoot']['pos'][3:5]
+                p_rfoot_k = current_state['rfoot']['pos'][3:5]
+            else: 
+                # Feet landing! It becomes the decision variable
+                if current_support == 'lfoot':
+                    p_lfoot_k = current_state['lfoot']['pos'][3:5]
+                    p_rfoot_k = self.p_swing # Right foot stepped
+                else:
+                    p_lfoot_k = self.p_swing # Left foot stepped
+                    p_rfoot_k = current_state['rfoot']['pos'][3:5]
+
+            p_contacts = self.generate_contact_points(p_lfoot_k, p_rfoot_k, 0.0)
+
+            # Applying Dynamics!
+            x_next = self.X[:, k] + self.delta * self.f(self.X[:, k], self.U[:, k], p_contacts)
+            self.opt.subject_to(self.X[:, k + 1] == x_next)
+            
+            # Friction cone enforcement
+            for i in range(4):
+                fx = self.U[i*3 + 0, k]
+                fy = self.U[i*3 + 1, k]
+                fz = self.U[i*3 + 2, k]
+                
+                self.opt.subject_to(fz >= 0) # Forces should point upwards from the ground
+                self.opt.subject_to(fx <=  self.mu * fz)
+                self.opt.subject_to(fx >= -self.mu * fz)
+                self.opt.subject_to(fy <=  self.mu * fz)
+                self.opt.subject_to(fy >= -self.mu * fz)
+                
+            # If flying phase, the FLYING FOOT should have zero forces
+            if phase == 'ss':
+                if support_foot == 'lfoot':
+                    self.opt.subject_to(self.U[6:12, k] == 0)
+                else:
+                    self.opt.subject_to(self.U[0:6, k] == 0)
+            
+        # K.C. for the leg
+        self.apply_kinematic_constraints(t)
+        
+        # Add here costs for tracking the desired trajectory and minimizing control effort
+        
+        # Solve
+        sol = self.opt.solve()
+        optimal_controls = sol.value(self.U[:, 0]) # Only first step (MPC)
+        target_state = self.extract_target_state(sol) # Get where I should be at next step
+        contact = self.footstep_planner.get_phase_at_time(t)
+        
+        return optimal_controls, target_state, contact
+    
+    def generate_contact_points(self, p_left_xy, p_right_xy, z):
+        d = self.foot_size / 2.0
+        
+        # Left foot
+        xl, yl = p_left_xy[0], p_left_xy[1]
+        # 1. Back Right
+        p0 = cs.vertcat(xl - d, yl - d, z)
+        # 2. Front Left
+        p1 = cs.vertcat(xl + d, yl + d, z)
+        
+        # Right foot
+        xr, yr = p_right_xy[0], p_right_xy[1]
+        # 3. Back Left
+        p2 = cs.vertcat(xr - d, yr + d, z)
+        # 4. Front Right
+        p3 = cs.vertcat(xr + d, yr - d, z)
+
+        return cs.vertcat(p0, p1, p2, p3)
