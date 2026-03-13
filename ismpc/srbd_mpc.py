@@ -185,6 +185,7 @@ class SrbdMpc:
         cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
         
         # Solve
+        self.opt.minimize(cost)
         sol = self.opt.solve()
         optimal_controls = sol.value(self.U[:, 0]) # Only first step (MPC)
         target_state = self.extract_target_state(sol) # Get where I should be at next step
@@ -210,3 +211,17 @@ class SrbdMpc:
         p3 = cs.vertcat(xr + d, yr - d, z)
 
         return cs.vertcat(p0, p1, p2, p3)
+    
+    def extract_target_state(self, sol):
+        x_target = sol.value(self.X[:, 1])
+        return {
+            'com': {
+                'pos': x_target[0:3],
+                'vel': x_target[3:6],
+                'acc': np.zeros(3) 
+            },
+            'base': {
+                'quat': x_target[6:10],
+                'omega': x_target[10:13]
+            }
+        }
