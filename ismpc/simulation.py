@@ -3,12 +3,12 @@ import dartpy as dart
 import copy
 from utils import *
 import os
-import ismpc
+import srbd_mpc
 import footstep_planner
 import inverse_dynamics as id
-import filter
 import foot_trajectory_generator as ftg
 from logger import Logger
+from scipy.spatial.transform import Rotation as R
 
 class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
     def __init__(self, world, hrp4):
@@ -18,24 +18,25 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.time = 0
         self.params = {
             'g': 9.81,
-            'h': 0.72,
             'foot_size': 0.1,
-            'step_height': 0.02,
+            'step_height': 0.05,
             'ss_duration': 70,
             'ds_duration': 30,
             'world_time_step': world.getTimeStep(),
             'first_swing': 'rfoot',
             'µ': 0.5,
-            'N': 100,
+            'N': 50, # Reduced horizon for testing speed maybe, original 100
             'dof': self.hrp4.getNumDofs(),
+            'mass': self.hrp4.getMass()
         }
-        self.params['eta'] = np.sqrt(self.params['g'] / self.params['h'])
 
         # robot links
         self.lsole = hrp4.getBodyNode('l_sole')
         self.rsole = hrp4.getBodyNode('r_sole')
         self.torso = hrp4.getBodyNode('torso')
         self.base  = hrp4.getBodyNode('body')
+
+        self.params['inertia'] = self.base.getInertia().getMoment()
 
         for i in range(hrp4.getNumJoints()):
             joint = hrp4.getJoint(i)
@@ -85,8 +86,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             self.params
             )
 
-        # initialize MPC controller
-        self.mpc = ismpc.Ismpc(
+        # initialize MPC controller (now SRBD!)
+        self.mpc = srbd_mpc.SrbdMpc(
             self.initial, 
             self.footstep_planner, 
             self.params
@@ -99,132 +100,147 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             self.params
             )
 
-        # initialize kalman filter
-        A = np.identity(3) + self.params['world_time_step'] * self.mpc.A_lip
-        B = self.params['world_time_step'] * self.mpc.B_lip
-        d = np.zeros(9)
-        d[7] = - self.params['world_time_step'] * self.params['g']
-        H = np.identity(3)
-        Q = block_diag(1., 1., 1.)
-        R = block_diag(1e1, 1e2, 1e4)
-        P = np.identity(3)
-        x = np.array([self.initial['com']['pos'][0], self.initial['com']['vel'][0], self.initial['zmp']['pos'][0], \
-                      self.initial['com']['pos'][1], self.initial['com']['vel'][1], self.initial['zmp']['pos'][1], \
-                      self.initial['com']['pos'][2], self.initial['com']['vel'][2], self.initial['zmp']['pos'][2]])
-        self.kf = filter.KalmanFilter(block_diag(A, A, A), \
-                                      block_diag(B, B, B), \
-                                      d, \
-                                      block_diag(H, H, H), \
-                                      block_diag(Q, Q, Q), \
-                                      block_diag(R, R, R), \
-                                      block_diag(P, P, P), \
-                                      x)
-
         # initialize logger and plots
         self.logger = Logger(self.initial)
         self.logger.initialize_plot(frequency=10)
         
     def customPreStep(self):
-        # create current and desired states
-        self.current = self.retrieve_state()
+        self.current = self.retrieve_state() # Get current state from the simulation
+        planner_tick = int(round(self.time / self.params['world_time_step']))
+        # --- AGGIORNAMENTO DINAMICO INERZIA PER SRBD-MPC ---
+        self.current['inertia'] = self.base.getInertia().getMoment()
+        print("inertia used by MPC:")
+        print(self.current['inertia'])
+        print("--------------------")
+        # --------------------------------------------------
 
-        # update kalman filter
-        u = np.array([self.desired['zmp']['vel'][0], self.desired['zmp']['vel'][1], self.desired['zmp']['vel'][2]])
-        self.kf.predict(u)
-        x_flt, _ = self.kf.update(np.array([self.current['com']['pos'][0], self.current['com']['vel'][0], self.current['zmp']['pos'][0], \
-                                            self.current['com']['pos'][1], self.current['com']['vel'][1], self.current['zmp']['pos'][1], \
-                                            self.current['com']['pos'][2], self.current['com']['vel'][2], self.current['zmp']['pos'][2]]))
-        
-        # update current state using kalman filter output
-        self.current['com']['pos'][0] = x_flt[0]
-        self.current['com']['vel'][0] = x_flt[1]
-        self.current['zmp']['pos'][0] = x_flt[2]
-        self.current['com']['pos'][1] = x_flt[3]
-        self.current['com']['vel'][1] = x_flt[4]
-        self.current['zmp']['pos'][1] = x_flt[5]
-        self.current['com']['pos'][2] = x_flt[6]
-        self.current['com']['vel'][2] = x_flt[7]
-        self.current['zmp']['pos'][2] = x_flt[8]
+        # 1. Calling control computation (MPC)
+        optimal_forces, target_state, _ = self.mpc.compute_controls(self.current, self.time)
+        phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
+        step_idx_now = self.footstep_planner.get_step_index_at_time(planner_tick)
 
-        # get references using mpc
-        lip_state, contact = self.mpc.solve(self.current, self.time)
+        if phase_now == 'ds':
+            support_foot_id = 'ds'
+            swing_foot_id = 'ds'
+        else:
+            support_foot_id = self.footstep_planner.plan[step_idx_now]['foot_id']
+            swing_foot_id = 'lfoot' if support_foot_id == 'rfoot' else 'rfoot'
 
-        self.desired['com']['pos'] = lip_state['com']['pos']
-        self.desired['com']['vel'] = lip_state['com']['vel']
-        self.desired['com']['acc'] = lip_state['com']['acc']
-        self.desired['zmp']['pos'] = lip_state['zmp']['pos']
-        self.desired['zmp']['vel'] = lip_state['zmp']['vel']
+        # 3. Update desired state based on MPC output
+        self.desired['com']['pos'] = target_state['com']['pos']
+        self.desired['com']['vel'] = target_state['com']['vel']
+        self.desired['com']['acc'] = target_state['com']['acc']
 
-        # get foot trajectories
-        feet_trajectories = self.foot_trajectory_generator.generate_feet_trajectories_at_time(self.time)
+        # Solver still expects ZMP references
+        self.desired['zmp']['pos'] = self.current['zmp']['pos']
+        self.desired['zmp']['vel'] = np.zeros(3)
+
+        # 4. Gait generation (FTG)
+        feet_trajectories = self.foot_trajectory_generator.generate_feet_trajectories_at_time(planner_tick)
         for foot in ['lfoot', 'rfoot']:
             for key in ['pos', 'vel', 'acc']:
                 self.desired[foot][key] = feet_trajectories[foot][key]
 
-        # set torso and base references to the average of the feet
-        for link in ['torso', 'base']:
-            for key in ['pos', 'vel', 'acc']:
-                self.desired[link][key] = (self.desired['lfoot'][key][:3] + self.desired['rfoot'][key][:3]) / 2.
+        # 5. Body & Orientation reference
+        target_quat = target_state['base']['quat']
+        target_quat_scipy = [target_quat[1], target_quat[2], target_quat[3], target_quat[0]]
+        rot_matrix_target = R.from_quat(target_quat_scipy).as_matrix()
 
-        # get torque commands using inverse dynamics
-        commands = self.id.get_joint_torques(self.desired, self.current, contact) 
+        # Base orientation reference
+        self.desired['base']['pos'] = rot_matrix_target
+        self.desired['base']['vel'] = target_state['base']['omega']
+        self.desired['base']['acc'] = np.zeros(3)
+        self.desired['base']['quat'] = target_quat
+        self.desired['base']['omega'] = target_state['base']['omega']
+
+        # Torso orientation reference
+        self.desired['torso']['pos'] = rot_matrix_target
+        self.desired['torso']['vel'] = target_state['base']['omega']
+        self.desired['torso']['acc'] = np.zeros(3)
+
+        # 6. WBC computations (Inverse Dynamics)
+        commands = self.id.get_joint_torques(self.desired, self.current, swing_foot_id, optimal_forces)
         
-        # set acceleration commands
+        # --- DEBUG BLOCK: WBC TORQUES ---
+        max_tau = np.max(np.abs(commands))
+        print(f"Time: {self.time} | Phase: {phase_now} | Swing Foot: {swing_foot_id}")
+        print(f"Coppia max: {max_tau:.1f} Nm")
+        print("-" * 20)
+        
+        # 7. Apply torques!
         for i in range(self.params['dof'] - 6):
             self.hrp4.setCommand(i + 6, commands[i])
 
-        # log and plot
-        self.logger.log_data(self.current, self.desired)
-        #self.logger.update_plot(self.time)
-
-        self.time += 1
+        # 8. Logger update
+        current_for_log = copy.deepcopy(self.current)
+        if 'inertia' in current_for_log:
+            del current_for_log['inertia'] 
+        self.logger.log_data(current_for_log, self.desired)
+    
+        self.time += self.params['world_time_step']
+     
 
     def retrieve_state(self):
-        # com and torso pose (orientation and position)
+        # 1. Posizioni e orientamenti (Matrici 3x3 per Torso e Base)
         com_position = self.hrp4.getCOM()
-        torso_orientation = get_rotvec(self.hrp4.getBodyNode('torso').getTransform(withRespectTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World()).rotation())
-        base_orientation  = get_rotvec(self.hrp4.getBodyNode('body' ).getTransform(withRespectTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World()).rotation())
+        
+        # Recuperiamo le matrici di rotazione invece dei vettori
+        torso_rot_matrix = self.hrp4.getBodyNode('torso').getTransform(
+            withRespectTo=dart.dynamics.Frame.World(), 
+            inCoordinatesOf=dart.dynamics.Frame.World()).rotation()
+        
+        base_rot_matrix = self.base.getTransform(
+            withRespectTo=dart.dynamics.Frame.World(), 
+            inCoordinatesOf=dart.dynamics.Frame.World()).rotation()
 
-        # feet poses (orientation and position)
+        # 2. Pose dei piedi (Manteniamo rotvec + pos per compatibilità con FTG)
         l_foot_transform = self.lsole.getTransform(withRespectTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         l_foot_orientation = get_rotvec(l_foot_transform.rotation())
         l_foot_position = l_foot_transform.translation()
         left_foot_pose = np.hstack((l_foot_orientation, l_foot_position))
+        
         r_foot_transform = self.rsole.getTransform(withRespectTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         r_foot_orientation = get_rotvec(r_foot_transform.rotation())
         r_foot_position = r_foot_transform.translation()
         right_foot_pose = np.hstack((r_foot_orientation, r_foot_position))
 
-        # velocities
+        # 3. Velocità
         com_velocity = self.hrp4.getCOMLinearVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         torso_angular_velocity = self.hrp4.getBodyNode('torso').getAngularVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         base_angular_velocity = self.hrp4.getBodyNode('body').getAngularVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
+        
         l_foot_spatial_velocity = self.lsole.getSpatialVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         r_foot_spatial_velocity = self.rsole.getSpatialVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
 
-        # compute total contact force
+        # 4. Calcolo forze di contatto e ZMP
         force = np.zeros(3)
-        for contact in world.getLastCollisionResult().getContacts():
+        collision_result = self.world.getLastCollisionResult()
+        for contact in collision_result.getContacts():
             force += contact.force
 
-        # compute zmp
         zmp = np.zeros(3)
-        zmp[2] = com_position[2] - force[2] / (self.hrp4.getMass() * self.params['g'] / self.params['h'])
-        for contact in world.getLastCollisionResult().getContacts():
-            if contact.force[2] <= 0.1: continue
-            zmp[0] += (contact.point[0] * contact.force[2] / force[2] + (zmp[2] - contact.point[2]) * contact.force[0] / force[2])
-            zmp[1] += (contact.point[1] * contact.force[2] / force[2] + (zmp[2] - contact.point[2]) * contact.force[1] / force[2])
-
-        if force[2] <= 0.1: # threshold for when we lose contact
-            zmp = np.array([0., 0., 0.]) # FIXME: this should return previous measurement
+        if force[2] <= 0.1:
+            zmp = np.array([0., 0., 0.])
         else:
-            # sometimes we get contact points that dont make sense, so we clip the ZMP close to the robot
-            midpoint = (l_foot_position + l_foot_position) / 2.
-            zmp[0] = np.clip(zmp[0], midpoint[0] - 0.3, midpoint[0] + 0.3)
-            zmp[1] = np.clip(zmp[1], midpoint[1] - 0.3, midpoint[1] + 0.3)
-            zmp[2] = np.clip(zmp[2], midpoint[2] - 0.3, midpoint[2] + 0.3)
-
-        # create state dict
+            zmp[2] = com_position[2] - force[2] / (self.hrp4.getMass() * self.params['g'] / 0.72)
+            for contact in collision_result.getContacts():
+                if contact.force[2] <= 0.1: continue
+                zmp[0] += (contact.point[0] * contact.force[2] / force[2] + (zmp[2] - contact.point[2]) * contact.force[0] / force[2])
+                zmp[1] += (contact.point[1] * contact.force[2] / force[2] + (zmp[2] - contact.point[2]) * contact.force[1] / force[2])
+            
+            # Clipping per stabilità numerica
+            midpoint = (l_foot_position + r_foot_position) / 2.
+            zmp = np.clip(zmp, midpoint - 0.3, midpoint + 0.3)
+        
+        # 5. Dati specifici per SRBD-MPC (Quaternioni e Omega)
+        quat_xyzw = R.from_matrix(base_rot_matrix).as_quat()
+        quat_xyzw = quat_xyzw / np.linalg.norm(quat_xyzw)
+        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+        # In retrieve_state
+        omega = self.base.getAngularVelocity(relativeTo=dart.dynamics.Frame.World(), 
+                                     inCoordinatesOf=dart.dynamics.Frame.World())
+        
+        # 6. Creazione del dizionario di stato
         return {
             'lfoot': {'pos': left_foot_pose,
                       'vel': l_foot_spatial_velocity,
@@ -235,12 +251,14 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             'com'  : {'pos': com_position,
                       'vel': com_velocity,
                       'acc': np.zeros(3)},
-            'torso': {'pos': torso_orientation,
+            'torso': {'pos': torso_rot_matrix, # Cambiato in Matrice 3x3
                       'vel': torso_angular_velocity,
                       'acc': np.zeros(3)},
-            'base' : {'pos': base_orientation,
+            'base' : {'pos': base_rot_matrix,  # Cambiato in Matrice 3x3
                       'vel': base_angular_velocity,
-                      'acc': np.zeros(3)},
+                      'acc': np.zeros(3),
+                      'quat': quat_wxyz,
+                      'omega': omega},
             'joint': {'pos': self.hrp4.getPositions(),
                       'vel': self.hrp4.getVelocities(),
                       'acc': np.zeros(self.params['dof'])},
@@ -259,6 +277,7 @@ if __name__ == "__main__":
     world.addSkeleton(hrp4)
     world.addSkeleton(ground)
     world.setGravity([0, 0, -9.81])
+    #cambio time stamp da 0.01 -0-001
     world.setTimeStep(0.01)
 
     # set default inertia

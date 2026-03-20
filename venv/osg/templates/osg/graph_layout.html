@@ -1,0 +1,7 @@
+{% load i18n %}
+{% extends "osg/graph.html" %}
+{% block content %}
+<a href="/graphs/{{graph.id}}/900/900/{{prog}}.png">
+<img src="/graphs/{{graph.id}}/400/400/{{prog}}.png" style="border:none;" alt="{{layout}}"/>
+</a>
+{% endblock %}

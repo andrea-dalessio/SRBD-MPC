@@ -1,0 +1,11 @@
+{% extends "osg/graph.html" %}
+{% block content %}
+{% if user.is_admin %}
+<form method="post">
+<table>
+{{form}}
+<tr colspan="2"><td><input type="submit" name="generate" value="generate" /></td></tr>
+</table>
+</form>
+{% endif %}
+{% endblock %}

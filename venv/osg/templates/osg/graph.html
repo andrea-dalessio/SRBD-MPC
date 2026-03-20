@@ -1,0 +1,39 @@
+{% load i18n %}
+<html>
+<body>
+
+<div style="float:left;width:200px;">
+<ul>
+{% if user.is_admin %}
+<li><a href="/graphs/{{prog}}/">{% trans 'generate' %}</a></li>
+{% endif %}
+</ul>
+{% if graphs %}
+{% for g in graphs %}
+<a href="/graphs/{{g.id}}/{{prog}}/">
+<img src="/graphs/{{g.id}}/150/150/{{prog}}.png" style="border:none;" alt="{{g.name}}"/>
+</a><br/>
+{% endfor %}
+{% endif %}
+</div>
+
+<div style="float:right;">
+{% block content %}
+{% endblock %}
+</div>
+
+{% if graph %}
+<div style="float:right;height:200px;">
+{% for layout in layouts %}
+<div style="float:left;">
+<a href="/graphs/{{graph.id}}/{{layout}}/">
+<img src="/graphs/{{graph.id}}/150/150/{{layout}}.png" style="border:none;" /><br/>
+</a>
+</div>
+{% endfor %}
+</table>
+</div>
+{% endif %}
+
+</body>
+</html>

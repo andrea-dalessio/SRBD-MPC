@@ -8,10 +8,17 @@ def rotation_vector_difference(rotvec_a, rotvec_b):
     R_diff = R_b.inv() * R_a
     return R_diff.as_rotvec()
 
+def rotation_error(R_des, R_curr):
+    # Calcola l'errore nel World Frame
+    R_err = np.dot(R_des, R_curr.T)
+    # Converte in rotvec (vettore d'errore 3x1)
+    return R.from_matrix(R_err).as_rotvec()
+
 def pose_difference(pose_a, pose_b):
-    pos_diff = pose_a[:3] - pose_b[:3]
-    rot_diff = rotation_vector_difference(pose_a[3:], pose_b[3:])
-    return np.hstack((pos_diff, rot_diff))
+    # pose is [ang (3), pos (3)]
+    rot_diff = rotation_vector_difference(pose_a[:3], pose_b[:3])
+    pos_diff = pose_a[3:] - pose_b[3:]
+    return np.hstack((rot_diff, pos_diff))
 
 # converts a rotation matrix to a rotation vector
 def get_rotvec(rot_matrix):

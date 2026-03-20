@@ -16,7 +16,7 @@ class FootTrajectoryGenerator:
     swing_foot = 'lfoot' if support_foot == 'rfoot' else 'rfoot'
     single_support_duration = self.footstep_planner.plan[step_index]['ss_duration']
 
-    # if first step, return initial foot poses with zero velocities and accelerations
+    # se primo passo restituisci posizioni iniziali
     if step_index == 0:
         zero_vel = np.zeros(6)
         zero_acc = np.zeros(6)
@@ -33,15 +33,16 @@ class FootTrajectoryGenerator:
             }
         }
 
-    # if double support, return planned foot poses with zero velocities and accelerations
+    # ds
     if phase == 'ds':
         support_pose = np.hstack((
             self.plan[step_index]['ang'],
             self.plan[step_index]['pos']
         ))
+        next_step_index = min(step_index + 1, len(self.plan) - 1)
         swing_pose = np.hstack((
-            self.plan[step_index + 1]['ang'],
-            self.plan[step_index + 1]['pos']
+            self.plan[next_step_index]['ang'],
+            self.plan[next_step_index]['pos']
         ))
         zero_vel = np.zeros(6)
         zero_acc = np.zeros(6)
@@ -58,11 +59,13 @@ class FootTrajectoryGenerator:
             }
         }
     
-    # get positions and angles for cubic interpolation
+    # get pos for cubic inter
     start_pos  = self.plan[step_index - 1]['pos']
-    target_pos = self.plan[step_index + 1]['pos']
+    
+    next_step_index = min(step_index + 1, len(self.plan) - 1)
+    target_pos = self.plan[next_step_index]['pos']
     start_ang  = self.plan[step_index - 1]['ang']
-    target_ang = self.plan[step_index + 1]['ang']
+    target_ang = self.plan[next_step_index]['ang']
 
     # time variables
     t = time_in_step
@@ -84,7 +87,7 @@ class FootTrajectoryGenerator:
     C =   16 * self.step_height / T**2
     swing_pos[2] =       A * t**4 +     B * t**3 +     C * t**2
     swing_vel[2] = ( 4 * A * t**3 + 3 * B * t**2 + 2 * C * t   ) / self.delta
-    swing_acc[2] = (12 * A * t**2 + 6 * B * t    + 2 * C       ) / self.delta**2
+    swing_acc[2] = (12 * A * t**2 + 6 * B * t    + 2 * C       ) / self.delta**2 
 
     # support foot remains stationary
     support_pos = self.plan[step_index]['pos']
