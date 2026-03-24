@@ -28,14 +28,13 @@ class SrbdMpc:
         
         R = self.quat_to_rot(q)
         
-        # --- NUOVA LOGICA SENZA cs.inv() ---
-        # Ruotiamo l'inversa invece di invertire la matrice ruotata
+
         I_world_inv = R @ self.I_body_inv @ R.T
         
         # Ci serve comunque I_world per il momento angolare L
         I_world = R @ self.I @ R.T
         L = I_world @ omega
-        # -----------------------------------
+
         
         u_sum = sum(u[i*3 : (i+1)*3] for i in range(8))
         return cs.vertcat(
@@ -95,13 +94,13 @@ class SrbdMpc:
         
     def compute_controls(self, current_state, t):
         planner_tick = int(round(t / self.delta))
-        # 3. Inizializzazione Problema di Ottimizzazione
+        #  Inizializzazione Problema di Ottimizzazione
         self.opt = cs.Opti()
         self.X = self.opt.variable(13, self.N + 1) 
         self.U = self.opt.variable(24, self.N)     
         self.p_swing = self.opt.variable(2)
 
-        # --- INIZIALIZZAZIONE E WARM START PER ALTE PERFORMANCE ---
+        # INIZIALIZZAZIONE E WARM START 
         if getattr(self, 'last_X', None) is not None:
             # Shift buffer di 5 ticks (frequenza simulatore 100Hz / MPC 20Hz)
             shift = 5
@@ -127,7 +126,7 @@ class SrbdMpc:
             "max_iter": 500,
             "print_level": 0,
             "sb": "yes",
-            "tol": 1e-3 # Tolleranza leggermente più alta per favorire la velocità
+            "tol": 1e-3 
         }
         self.opt.solver('ipopt', p_opts, s_opts)
         
@@ -143,7 +142,7 @@ class SrbdMpc:
         current_step_index = self.footstep_planner.get_step_index_at_time(planner_tick)
         current_support = self.footstep_planner.plan[current_step_index]['foot_id']
         
-        # --- TUNING PESI (Aggiornati per favorire il moto) ---
+        #  TUNING PESI 
         cost = 0.0
         W_com_z = 5000
         W_com_xy = 100
@@ -187,15 +186,14 @@ class SrbdMpc:
 
             p_contacts = self.generate_contact_points(p_lfoot_k, p_rfoot_k, yaw_l_k, yaw_r_k, 0.0)
 
-            # --- DINAMICA E VINCOLI FISICI ---
+            # DINAMICA E VINCOLI FISICI 
             x_k = self.X[:, k]
             u_k = self.U[:, k]
             
-            # Integrazione dinamica (ora con inerzia ruotata gestita in self.f)
+            # Integrazione dinamica 
             x_next = x_k + self.delta * self.f(x_k, u_k, p_contacts)
             self.opt.subject_to(self.X[:, k + 1] == x_next)
             
-            # Vincolo unitarietà del quaternione (fondamentale per SRBD)
             
             
             for i in range(8):
@@ -219,7 +217,7 @@ class SrbdMpc:
                     self.opt.subject_to(self.opt.bounded(-1e-4, self.U[12:24, k], 1e-4))
 
             
-            # --- FUNZIONE DI COSTO ---
+            # Cost function
             # Altezza CoM
             cost += W_com_z * (self.X[2, k + 1] - h_ref)**2
             
@@ -255,11 +253,10 @@ class SrbdMpc:
         
         self.opt.minimize(cost)
         
-        # --- SOLUZIONE ---
         try:
             sol = self.opt.solve()
             
-            # Salvare per Warm Start e Buffering!
+            # Salvare per Warm Start e Buffering
             self.last_X = sol.value(self.X)
             self.last_U = sol.value(self.U)
             
@@ -270,13 +267,11 @@ class SrbdMpc:
             print(f"--- STEP {t} --- [X] IPOPT FALLITO!")
             self.opt.debug.show_infeasibilities()
 
-            # Fallback sicuro
             optimal_controls = np.zeros(24)
             fz_each = (self.mass * abs(self.g[2])) / 8.0
             for i in range(8):
                 optimal_controls[i*3 + 2] = fz_each
 
-            # Target conservativo: resta sullo stato corrente
             target_state = {
                 'com': {
                     'pos': current_state['com']['pos'].copy(),

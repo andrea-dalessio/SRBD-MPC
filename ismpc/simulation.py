@@ -106,12 +106,12 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
     def customPreStep(self):
         self.current = self.retrieve_state() # Get current state from the simulation
         planner_tick = int(round(self.time / self.params['world_time_step']))
-        # --- AGGIORNAMENTO DINAMICO INERZIA PER SRBD-MPC ---
+
         self.current['inertia'] = self.base.getInertia().getMoment()
         print("inertia used by MPC:")
         print(self.current['inertia'])
         print("--------------------")
-        # --------------------------------------------------
+
         import sys
         if self.time > 26.0:
             print("\n*** SIMULAZIONE COMPLETATA (26s) ***")
@@ -124,7 +124,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
          #   # Spinta laterale forte sul busto: 100N sull'asse Y negativo
          #   self.torso.addExtForce([0.0, -100.0, 0.0], [0.0, 0.0, 0.0], isForceLocal=False, isOffsetLocal=True)
           #  if round(self.time, 3) % 0.05 == 0:
-          #      print(f"⚠️ [CRASH TEST] Impatto di -100N in corso! (t={self.time:.2f})")
+          #      print(f" [CRASH TEST] Impatto di -100N in corso! (t={self.time:.2f})")
 
         # 1. Calling control computation (MPC)
         if not hasattr(self, 'mpc_freq'):
@@ -155,7 +155,6 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.desired['com']['vel'] = target_state['com']['vel']
         self.desired['com']['acc'] = target_state['com']['acc']
 
-        # Solver still expects ZMP references
         self.desired['zmp']['pos'] = self.current['zmp']['pos']
         self.desired['zmp']['vel'] = np.zeros(3)
 
@@ -185,13 +184,13 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         # 6. WBC computations (Inverse Dynamics)
         commands = self.id.get_joint_torques(self.desired, self.current, swing_foot_id, optimal_forces)
         
-        # --- DEBUG BLOCK: WBC TORQUES ---
+        # Debug
         max_tau = np.max(np.abs(commands))
         print(f"Time: {self.time} | Phase: {phase_now} | Swing Foot: {swing_foot_id}")
         print(f"Coppia max: {max_tau:.1f} Nm")
         print("-" * 20)
         
-        # 7. Apply torques!
+        # 7. Apply torques
         for i in range(self.params['dof'] - 6):
             self.hrp4.setCommand(i + 6, commands[i])
 
@@ -205,7 +204,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
      
 
     def retrieve_state(self):
-        # 1. Posizioni e orientamenti (Matrici 3x3 per Torso e Base)
+        # 1. Posizioni e orientamenti 
         com_position = self.hrp4.getCOM()
         
         # Recuperiamo le matrici di rotazione invece dei vettori
@@ -217,7 +216,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             withRespectTo=dart.dynamics.Frame.World(), 
             inCoordinatesOf=dart.dynamics.Frame.World()).rotation()
 
-        # 2. Pose dei piedi (Manteniamo rotvec + pos per compatibilità con FTG)
+        # 2. Pose dei piedi 
         l_foot_transform = self.lsole.getTransform(withRespectTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         l_foot_orientation = get_rotvec(l_foot_transform.rotation())
         l_foot_position = l_foot_transform.translation()
@@ -256,7 +255,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             midpoint = (l_foot_position + r_foot_position) / 2.
             zmp = np.clip(zmp, midpoint - 0.3, midpoint + 0.3)
         
-        # 5. Dati specifici per SRBD-MPC (Quaternioni e Omega)
+        # 5. Quaternioni e Omega
         quat_xyzw = R.from_matrix(base_rot_matrix).as_quat()
         quat_xyzw = quat_xyzw / np.linalg.norm(quat_xyzw)
         quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
@@ -275,10 +274,10 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             'com'  : {'pos': com_position,
                       'vel': com_velocity,
                       'acc': np.zeros(3)},
-            'torso': {'pos': torso_rot_matrix, # Cambiato in Matrice 3x3
+            'torso': {'pos': torso_rot_matrix, 
                       'vel': torso_angular_velocity,
                       'acc': np.zeros(3)},
-            'base' : {'pos': base_rot_matrix,  # Cambiato in Matrice 3x3
+            'base' : {'pos': base_rot_matrix,  
                       'vel': base_angular_velocity,
                       'acc': np.zeros(3),
                       'quat': quat_wxyz,
@@ -301,7 +300,6 @@ if __name__ == "__main__":
     world.addSkeleton(hrp4)
     world.addSkeleton(ground)
     world.setGravity([0, 0, -9.81])
-    #cambio time stamp da 0.01 -0-001
     world.setTimeStep(0.01)
 
     # set default inertia
@@ -315,16 +313,14 @@ if __name__ == "__main__":
 
     # create world node and add it to viewer
     viewer = dart.gui.osg.Viewer()
-    node.setTargetRealTimeFactor(10) # speed up the visualization by 10x
+    node.setTargetRealTimeFactor(10) 
     viewer.addWorldNode(node)
 
     #viewer.setUpViewInWindow(0, 0, 1920, 1080)
     viewer.setUpViewInWindow(0, 0, 1280, 720)
-    #viewer.setUpViewInWindow(0, 0, 640, 480)
     viewer.setCameraHomePosition([5., -1., 1.5],
                                  [1.,  0., 0.5],
                                  [0.,  0., 1. ])
     viewer.run()
     
-    # Mostra i grafici riassuntivi della simulazione alla chiusura
     node.logger.show_all_plots()

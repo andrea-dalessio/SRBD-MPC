@@ -27,10 +27,10 @@ class InverseDynamics:
             if joint_name in redundant_dofs:
                 self.joint_selection[i, i] = 1
 
-    def get_joint_torques(self, desired, current, contact, optimal_forces):
+    def get_joint_torques(self, desired, current, swing_Foot, optimal_forces):
         # 1. Identificazione fasi di contatto (booleani numerici)
-        contact_l = 1.0 if (contact == 'ds' or contact == 'rfoot') else 0.0
-        contact_r = 1.0 if (contact == 'ds' or contact == 'lfoot') else 0.0
+        contact_l = 1.0 if (swing_Foot == 'ds' or swing_Foot == 'rfoot') else 0.0
+        contact_r = 1.0 if (swing_Foot == 'ds' or swing_Foot == 'lfoot') else 0.0
         lsole = self.robot.getBodyNode('l_sole')
         rsole = self.robot.getBodyNode('r_sole')
         torso = self.robot.getBodyNode('torso')
@@ -38,8 +38,8 @@ class InverseDynamics:
         # 2. Trasformazione Forze MPC (Puntuali) -> Wrench (6D) per la WBC
         # L'MPC lavora nel World Frame, quindi calcoliamo i momenti nel World Frame
         d = self.d 
-        f0, f1 = optimal_forces[0:3], optimal_forces[3:6]   # Punti contatto piede Sx
-        f2, f3 = optimal_forces[6:9], optimal_forces[9:12] # Punti contatto piede Dx
+        f0, f1 = optimal_forces[0:3], optimal_forces[3:6]   
+        f2, f3 = optimal_forces[6:9], optimal_forces[9:12] 
 
         R_l = lsole.getTransform().rotation()
         R_r = rsole.getTransform().rotation()
@@ -79,9 +79,9 @@ class InverseDynamics:
         
         f_c_ref = np.concatenate((wrench_l_local, wrench_r_local))
         
-        if contact == 'lfoot':
+        if swing_Foot == 'lfoot':
             f_c_ref[:6] *= 0.0
-        elif contact == 'rfoot':
+        elif swing_Foot == 'rfoot':
             f_c_ref[6:] *= 0.0
 
         # 4. TUNING PESI E GUADAGNI (Aggiornati per SRBD)
@@ -206,7 +206,7 @@ class InverseDynamics:
             return np.zeros(self.dofs - 6)
 
         tau = solution[tau_indices]
-        joint_torques = tau[6:] # Rimuovi i 6 DOF della base fluttuante
+        joint_torques = tau[6:] 
         
-        # Clip finale per proteggere i motori della simulazione
+       
         return np.clip(joint_torques, -100.0, 100.0)
