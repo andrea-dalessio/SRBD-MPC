@@ -10,55 +10,93 @@ class Logger():
                 self.log['current', item, level] = []
 
 
-    def log_data(self, desired, current):
+    def log_data(self, desired, current, forces=None, commands=None):
         for item in desired.keys():
             for level in desired[item].keys():
                 self.log['desired', item, level].append(desired[item][level])
                 self.log['current', item, level].append(current[item][level])
-
-    def initialize_plot(self, frequency=1):
-        self.frequency = frequency
-        self.plot_info = [
-            {'axis': 0, 'batch': 'desired', 'item': 'com', 'level': 'pos', 'dim': 0, 'color': 'blue' , 'style': '-' },
-            {'axis': 0, 'batch': 'current', 'item': 'com', 'level': 'pos', 'dim': 0, 'color': 'blue' , 'style': '--'},
-            {'axis': 0, 'batch': 'desired', 'item': 'zmp', 'level': 'pos', 'dim': 0, 'color': 'green', 'style': '-' },
-            {'axis': 0, 'batch': 'current', 'item': 'zmp', 'level': 'pos', 'dim': 0, 'color': 'green', 'style': '--'},
-            {'axis': 1, 'batch': 'desired', 'item': 'com', 'level': 'pos', 'dim': 1, 'color': 'blue' , 'style': '-' },
-            {'axis': 1, 'batch': 'current', 'item': 'com', 'level': 'pos', 'dim': 1, 'color': 'blue' , 'style': '--'},
-            {'axis': 1, 'batch': 'desired', 'item': 'zmp', 'level': 'pos', 'dim': 1, 'color': 'green', 'style': '-' },
-            {'axis': 1, 'batch': 'current', 'item': 'zmp', 'level': 'pos', 'dim': 1, 'color': 'green', 'style': '--'},
-            {'axis': 2, 'batch': 'desired', 'item': 'com', 'level': 'pos', 'dim': 2, 'color': 'blue' , 'style': '-' },
-            {'axis': 2, 'batch': 'current', 'item': 'com', 'level': 'pos', 'dim': 2, 'color': 'blue' , 'style': '--'},
-            {'axis': 2, 'batch': 'desired', 'item': 'zmp', 'level': 'pos', 'dim': 2, 'color': 'green', 'style': '-' },
-            {'axis': 2, 'batch': 'current', 'item': 'zmp', 'level': 'pos', 'dim': 2, 'color': 'green', 'style': '--'},
-        ]
-
-        plot_num = np.max([item['axis'] for item in self.plot_info]) + 1
-        self.fig, self.ax = plt.subplots(plot_num, 1, figsize=(6, 8))
-
-        self.lines = {}
-        for item in self.plot_info:
-            key = item['batch'], item['item'], item['level'], item['dim']
-            self.lines[key], = self.ax[item['axis']].plot([], [], color=item['color'], linestyle=item['style'])
         
-        plt.ion()
-        plt.show()
-
-    def update_plot(self, time):
-        if time % self.frequency != 0:
-            return
-
-        for item in self.plot_info:
-            trajectory_key = item['batch'], item['item'], item['level']
-            trajectory = np.array(self.log[trajectory_key]).T[item['dim']]
-            line_key = item['batch'], item['item'], item['level'], item['dim']
-            self.lines[line_key].set_data(np.arange(len(trajectory)), trajectory)
-
-        # set limits
-        for i in range(len(self.ax)):
-            self.ax[i].relim()
-            self.ax[i].autoscale_view()
+        if forces is not None:
+            if 'forces' not in self.log:
+                self.log['forces'] = []
+            self.log['forces'].append(forces)
             
-        # redraw the plot
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
+        if commands is not None:
+            if 'commands' not in self.log:
+                self.log['commands'] = []
+            self.log['commands'].append(commands)
+
+    def show_all_plots(self):
+        print("Visualizzazione dei grafici in corso...")
+        
+        # Estrazione Dati
+        com_des = np.array(self.log['desired', 'com', 'pos'])
+        com_cur = np.array(self.log['current', 'com', 'pos'])
+        zmp_des = np.array(self.log['desired', 'zmp', 'pos'])
+        zmp_cur = np.array(self.log['current', 'zmp', 'pos'])
+        quat_des = np.array(self.log['desired', 'base', 'quat'])
+        quat_cur = np.array(self.log['current', 'base', 'quat'])
+        
+        time_steps = np.arange(len(com_des))
+        
+        fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Analisi SRBD-MPC ed Inverse Dynamics', fontsize=16)
+
+        # 1. CoM Tracking (X, Y, Z)
+        ax = axs[0, 0]
+        ax.plot(time_steps, com_des[:, 0], 'r--', label='X Des')
+        ax.plot(time_steps, com_cur[:, 0], 'r-', label='X Cur')
+        ax.plot(time_steps, com_des[:, 1], 'g--', label='Y Des')
+        ax.plot(time_steps, com_cur[:, 1], 'g-', label='Y Cur')
+        ax.plot(time_steps, com_des[:, 2], 'b--', label='Z Des')
+        ax.plot(time_steps, com_cur[:, 2], 'b-', label='Z Cur')
+        ax.set_title('CoM Tracking (Metri)')
+        ax.legend(loc='lower left', prop={'size': 7})
+        ax.grid(True)
+
+        # 2. Orientamento Base (Quaternioni XYZ)
+        ax = axs[0, 1]
+        # In SRBD il controllo d'assetto sostituisce lo ZMP del LIP.
+        # Plottiamo le componenti X, Y, Z del quaternione del torso per vedere la stabilità.
+        ax.plot(time_steps, quat_cur[:, 1], label='Qx (Roll base)')
+        ax.plot(time_steps, quat_cur[:, 2], label='Qy (Pitch base)')
+        ax.plot(time_steps, quat_cur[:, 3], label='Qz (Yaw base)')
+        ax.set_title('Base Orientation (Quaternions Tracking)')
+        ax.set_ylabel('Quat Value')
+        ax.legend(loc='lower left')
+        ax.grid(True)
+
+        # 3. Forze Verticali (GRF)
+        ax = axs[1, 0]
+        if 'forces' in self.log and len(self.log['forces']) > 0:
+            forces = np.array(self.log['forces']) # Shape (T, 24)
+            # Ricordiamo che U è [fx,fy,fz] x 4 per Left e x 4 per Right
+            # Fz totale = somma degli indici 2, 5, 8, 11 (Left) e 14, 17, 20, 23 (Right)
+            fz_left = np.sum(forces[:, [2, 5, 8, 11]], axis=1)
+            fz_right = np.sum(forces[:, [14, 17, 20, 23]], axis=1)
+            fz_tot = fz_left + fz_right
+            ax.plot(time_steps, fz_tot, 'k-', label='Fz Totale (~376 N)')
+            ax.plot(time_steps, fz_left, 'b-', label='Fz Left', alpha=0.7)
+            ax.plot(time_steps, fz_right, 'r-', label='Fz Right', alpha=0.7)
+            ax.set_title('Ground Reaction Forces Z (Newton)')
+            ax.legend()
+        else:
+            ax.set_title('Forze non loggate')
+        ax.grid(True)
+
+        # 4. Coppie WBC Inverse Dynamics
+        ax = axs[1, 1]
+        if 'commands' in self.log and len(self.log['commands']) > 0:
+            commands = np.array(self.log['commands'])
+            # Mostriamo le coppie delle prime 6 giunture loggate (es. anca e caviglia)
+            for i in range(min(6, commands.shape[1])):
+                ax.plot(time_steps, commands[:, i], label=f'Joint {i} Tau')
+            ax.set_title('Inverse Dynamics Torques (WBC)')
+            ax.set_ylabel('Nm')
+            ax.legend(prop={'size': 7})
+        else:
+            ax.set_title('Torques non loggati')
+        ax.grid(True)
+
+        plt.tight_layout()
+        plt.show()

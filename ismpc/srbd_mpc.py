@@ -19,6 +19,8 @@ class SrbdMpc:
         
         # Definizione della dinamica f con rotazione dell'inerzia
         self.f = lambda x, u, p_contacts: self._get_dynamics_with_rot_inertia(x, u, p_contacts)
+        self.last_X = None
+        self.last_U = None
 
     def _get_dynamics_with_rot_inertia(self, x, u, p_contacts):
         q = x[6:10]      
@@ -99,15 +101,26 @@ class SrbdMpc:
         self.U = self.opt.variable(24, self.N)     
         self.p_swing = self.opt.variable(2)
 
-        # --- INIZIALIZZAZIONE ---
-        for k in range(self.N + 1):
-            self.opt.set_initial(self.X[0:3, k], current_state['com']['pos'])
-            self.opt.set_initial(self.X[6:10, k], current_state['base']['quat'])
-        
-        # Guess iniziale delle forze pari a un ottavo del peso per ogni punto di contatto
-        f_z_guess = (self.params['mass'] * 9.81) / 8.0
-        for i in range(8):
-            self.opt.set_initial(self.U[i*3 + 2, :], f_z_guess)        
+        # --- INIZIALIZZAZIONE E WARM START PER ALTE PERFORMANCE ---
+        if getattr(self, 'last_X', None) is not None:
+            # Shift buffer di 5 ticks (frequenza simulatore 100Hz / MPC 20Hz)
+            shift = 5
+            if self.N > shift:
+                X_guess = np.hstack((self.last_X[:, shift:], np.tile(self.last_X[:, -1:], (1, shift))))
+                U_guess = np.hstack((self.last_U[:, shift:], np.tile(self.last_U[:, -1:], (1, shift))))
+            else:
+                X_guess = self.last_X
+                U_guess = self.last_U
+            self.opt.set_initial(self.X, X_guess)
+            self.opt.set_initial(self.U, U_guess)
+        else:
+            for k in range(self.N + 1):
+                self.opt.set_initial(self.X[0:3, k], current_state['com']['pos'])
+                self.opt.set_initial(self.X[6:10, k], current_state['base']['quat'])
+            
+            f_z_guess = (self.params['mass'] * 9.81) / 8.0
+            for i in range(8):
+                self.opt.set_initial(self.U[i*3 + 2, :], f_z_guess)        
         
         p_opts = {"expand": True, "print_time": False}
         s_opts = {
@@ -245,9 +258,14 @@ class SrbdMpc:
         # --- SOLUZIONE ---
         try:
             sol = self.opt.solve()
-            optimal_controls = sol.value(self.U[:, 0])
+            
+            # Salvare per Warm Start e Buffering!
+            self.last_X = sol.value(self.X)
+            self.last_U = sol.value(self.U)
+            
+            optimal_controls = self.last_U[:, 0]
             target_state = self.extract_target_state(sol)
-            print(f"--- STEP {t} --- [V] IPOPT Successo")
+            print(f"--- STEP {t} --- [V] IPOPT | Iters: {self.opt.stats()['iter_count']}")
         except Exception as e:
             print(f"--- STEP {t} --- [X] IPOPT FALLITO!")
             self.opt.debug.show_infeasibilities()
@@ -270,6 +288,16 @@ class SrbdMpc:
                     'omega': current_state['base']['omega'].copy()
                 }
             }
+            
+            # Setup buffer per get_buffered salvandoli come fallback
+            self.last_X = np.zeros((13, self.N + 1))
+            for k in range(self.N + 1):
+                self.last_X[0:3, k] = target_state['com']['pos']
+                self.last_X[6:10, k] = target_state['base']['quat']
+            self.last_U = np.zeros((24, self.N))
+            for k in range(self.N):
+                for i in range(8):
+                    self.last_U[i*3 + 2, k] = fz_each
         
         fz_tot = sum(optimal_controls[i*3 + 2] for i in range(8))
         print(f"Forza Z Totale: {fz_tot:.1f} N | Coppia Max: {np.max(np.abs(optimal_controls)):.1f}")
@@ -282,6 +310,30 @@ class SrbdMpc:
             contact = self.footstep_planner.plan[step_idx]['foot_id']
             
         return optimal_controls, target_state, contact
+    
+    
+    def get_buffered_forces(self, tick_offset):
+        if not hasattr(self, 'last_U') or self.last_U is None:
+            return np.zeros(24)
+        idx = min(tick_offset, self.N - 1)
+        return self.last_U[:, idx]
+
+    def get_buffered_state(self, tick_offset):
+        if not hasattr(self, 'last_X') or self.last_X is None:
+            return None
+        idx = min(tick_offset + 1, self.N)
+        x_target = self.last_X[:, idx]
+        return {
+            'com': {
+                'pos': x_target[0:3],
+                'vel': x_target[3:6],
+                'acc': np.zeros(3) 
+            },
+            'base': {
+                'quat': x_target[6:10],
+                'omega': x_target[10:13]
+            }
+        }
     
     def generate_contact_points(self, p_left_xy, p_right_xy, yaw_l, yaw_r, z):
         d = self.foot_size / 2.0

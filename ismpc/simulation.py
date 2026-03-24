@@ -102,7 +102,6 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         # initialize logger and plots
         self.logger = Logger(self.initial)
-        self.logger.initialize_plot(frequency=10)
         
     def customPreStep(self):
         self.current = self.retrieve_state() # Get current state from the simulation
@@ -113,9 +112,34 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         print(self.current['inertia'])
         print("--------------------")
         # --------------------------------------------------
+        import sys
+        if self.time > 26.0:
+            print("\n*** SIMULAZIONE COMPLETATA (26s) ***")
+            print("Apertura Dashboard Grafici...")
+            self.logger.show_all_plots()
+            sys.exit(0)
+
+        # --- TEST DISTURBI ESTERNI (Robustezza SRBD-MPC) ---
+        #if 5.0 < self.time < 5.15:
+         #   # Spinta laterale forte sul busto: 100N sull'asse Y negativo
+         #   self.torso.addExtForce([0.0, -100.0, 0.0], [0.0, 0.0, 0.0], isForceLocal=False, isOffsetLocal=True)
+          #  if round(self.time, 3) % 0.05 == 0:
+          #      print(f"⚠️ [CRASH TEST] Impatto di -100N in corso! (t={self.time:.2f})")
 
         # 1. Calling control computation (MPC)
-        optimal_forces, target_state, _ = self.mpc.compute_controls(self.current, self.time)
+        if not hasattr(self, 'mpc_freq'):
+            self.mpc_freq = 5 # 20 Hz
+            self.mpc_tick_offset = 0
+
+        current_support = self.footstep_planner.plan[self.footstep_planner.get_step_index_at_time(planner_tick)]['foot_id']
+        
+        if self.mpc_tick_offset % self.mpc_freq == 0:
+            _, _, _ = self.mpc.compute_controls(self.current, self.time)
+            self.mpc_tick_offset = 0
+
+        optimal_forces = self.mpc.get_buffered_forces(self.mpc_tick_offset)
+        target_state = self.mpc.get_buffered_state(self.mpc_tick_offset)
+        self.mpc_tick_offset += 1
         phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
         step_idx_now = self.footstep_planner.get_step_index_at_time(planner_tick)
 
@@ -175,7 +199,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         current_for_log = copy.deepcopy(self.current)
         if 'inertia' in current_for_log:
             del current_for_log['inertia'] 
-        self.logger.log_data(current_for_log, self.desired)
+        self.logger.log_data(current_for_log, self.desired, optimal_forces, commands)
     
         self.time += self.params['world_time_step']
      
@@ -301,3 +325,6 @@ if __name__ == "__main__":
                                  [1.,  0., 0.5],
                                  [0.,  0., 1. ])
     viewer.run()
+    
+    # Mostra i grafici riassuntivi della simulazione alla chiusura
+    node.logger.show_all_plots()
