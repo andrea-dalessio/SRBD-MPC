@@ -8,6 +8,13 @@ class Logger():
             for level in initial[item].keys():
                 self.log['desired', item, level] = []
                 self.log['current', item, level] = []
+        
+        self.initial_plan = None
+        self.post_impact_plan = None
+
+    def log_footsteps(self, initial_plan, post_impact_plan):
+        self.initial_plan = initial_plan
+        self.post_impact_plan = post_impact_plan
 
 
     def log_data(self, desired, current, forces=None, commands=None):
@@ -99,4 +106,31 @@ class Logger():
         ax.grid(True)
 
         plt.tight_layout()
+        
+        # New figure for footsteps
+        if hasattr(self, 'initial_plan') and self.initial_plan is not None:
+            fig2, ax2 = plt.subplots(figsize=(8, 10))
+            fig2.suptitle('Footstep Replanning (2D Map)', fontsize=16)
+
+            # Plotta i footprint iniziali
+            for i, step in enumerate(self.initial_plan):
+                x, y, z = step['pos']
+                color = 'blue' if step['foot_id'] == 'lfoot' else 'blue'
+                ax2.plot(x, y, marker='s', markersize=30, color=color, alpha=0.2)
+                ax2.text(x, y, str(i), color=color, fontsize=14, ha='center', va='center', fontweight='bold')
+
+            # Plotta i footprint post impatto
+            if hasattr(self, 'post_impact_plan') and self.post_impact_plan is not None:
+                for i, step in enumerate(self.post_impact_plan):
+                    x, y, z = step['pos']
+                    ax2.plot(x, y, marker='s', markersize=30, markeredgecolor='red', markerfacecolor='none', linestyle='--', linewidth=3)
+                    ax2.text(x, y+0.04, f"{i}'", color='red', fontsize=14, ha='center', va='center', fontweight='bold')
+
+            ax2.set_xlabel('X (m)')
+            ax2.set_ylabel('Y (m)')
+            ax2.set_title('Confronto Traiettoria (Trasparente: nominale | Bordata Rossa: ri-pianificata)')
+            ax2.grid(True)
+            ax2.axis('equal')
+            fig2.tight_layout()
+
         plt.show()

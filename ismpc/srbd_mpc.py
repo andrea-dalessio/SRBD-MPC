@@ -84,15 +84,29 @@ class SrbdMpc:
     def apply_kinematic_constraints(self, t):
         current_step_index = self.footstep_planner.get_step_index_at_time(t)
         support_foot_pos = self.footstep_planner.plan[current_step_index]['pos']
+        support_id = self.footstep_planner.plan[current_step_index]['foot_id']
         
         L_max = 0.5 # maximum leg length
 
+        # Limite radiale semplice
         self.opt.subject_to( 
             (self.p_swing[0] - support_foot_pos[0])**2 + 
             (self.p_swing[1] - support_foot_pos[1])**2 <= L_max**2 
         )
         
-    def compute_controls(self, current_state, t):
+        # VINCOLO ANTI-COMPENETRAZIONE (No Crossed Legs)
+        # La gamba sinistra (Y positivo) deve restare a sinistra della destra (Y negativo)
+        min_clearance = 0.10  # Minimo 10 cm tra i piedi
+        if support_id == 'lfoot':
+            # Piede d'appoggio è il sinistro, quindi p_swing è il destro.
+            # Il destro deve restare a DESTRA del sinistro (y_destro < y_sinistro - clearance)
+            self.opt.subject_to(self.p_swing[1] <= support_foot_pos[1] - min_clearance)
+        else:
+            # Piede d'appoggio è il destro, quindi p_swing è il sinistro.
+            # Il sinistro deve restare a SINISTRA del destro (y_sinistro > y_destro + clearance)
+            self.opt.subject_to(self.p_swing[1] >= support_foot_pos[1] + min_clearance)
+        
+    def compute_controls(self, current_state, t, nominal_plan=None):
         planner_tick = int(round(t / self.delta))
         #  Inizializzazione Problema di Ottimizzazione
         self.opt = cs.Opti()
@@ -163,26 +177,48 @@ class SrbdMpc:
             phase = self.footstep_planner.get_phase_at_time(planner_tick_k)
             support_foot = self.footstep_planner.plan[future_step_index]['foot_id']
             
-            # Determinazione posizioni piedi nell'orizzonte
-            if future_step_index == current_step_index: 
+            # --- UNIVERSAL HORIZON EVALUATOR ---
+            if nominal_plan is not None:
+                plan_to_use = nominal_plan
+            else:
+                plan_to_use = self.footstep_planner.plan
+
+            # Trova l'ultimo step in cui LFOOT era il piede di swing
+            last_swing_l = -1
+            for j in range(current_step_index, future_step_index + 1):
+                j_valid = min(j, len(plan_to_use)-1)
+                # se il supporto è rfoot, LFOOT è lo swing
+                if plan_to_use[j_valid]['foot_id'] == 'rfoot': 
+                    last_swing_l = j_valid
+            
+            if last_swing_l == -1:
                 p_lfoot_k = current_state['lfoot']['pos'][3:5]
                 yaw_l_k   = current_state['lfoot']['pos'][2]
+            elif last_swing_l == current_step_index:
+                p_lfoot_k = self.p_swing
+                yaw_l_k   = plan_to_use[last_swing_l]['ang'][2]
+            else:
+                p_lfoot_k = plan_to_use[last_swing_l]['pos'][0:2]
+                yaw_l_k   = plan_to_use[last_swing_l]['ang'][2]
+
+            # Trova l'ultimo step in cui RFOOT era il piede di swing
+            last_swing_r = -1
+            for j in range(current_step_index, future_step_index + 1):
+                j_valid = min(j, len(plan_to_use)-1)
+                # se il supporto è lfoot, RFOOT è lo swing
+                if plan_to_use[j_valid]['foot_id'] == 'lfoot': 
+                    last_swing_r = j_valid
+
+            if last_swing_r == -1:
                 p_rfoot_k = current_state['rfoot']['pos'][3:5]
                 yaw_r_k   = current_state['rfoot']['pos'][2]
-            else: 
-                if current_support == 'lfoot':
-                    p_lfoot_k = current_state['lfoot']['pos'][3:5]
-                    yaw_l_k   = current_state['lfoot']['pos'][2]
-                    p_rfoot_k = self.p_swing # Piede destro è quello che atterrerà
-                    
-                    next_idx = min(future_step_index, len(self.footstep_planner.plan)-1)
-                    yaw_r_k   = self.footstep_planner.plan[next_idx]['ang'][2]
-                else:
-                    p_lfoot_k = self.p_swing # Piede sinistro è quello che atterrerà
-                    next_idx = min(future_step_index, len(self.footstep_planner.plan)-1)
-                    yaw_l_k   = self.footstep_planner.plan[next_idx]['ang'][2]
-                    p_rfoot_k = current_state['rfoot']['pos'][3:5]
-                    yaw_r_k   = current_state['rfoot']['pos'][2]
+            elif last_swing_r == current_step_index:
+                p_rfoot_k = self.p_swing
+                yaw_r_k   = plan_to_use[last_swing_r]['ang'][2]
+            else:
+                p_rfoot_k = plan_to_use[last_swing_r]['pos'][0:2]
+                yaw_r_k   = plan_to_use[last_swing_r]['ang'][2]
+            # --- END UNIVERSAL HORIZON EVALUATOR ---
 
             p_contacts = self.generate_contact_points(p_lfoot_k, p_rfoot_k, yaw_l_k, yaw_r_k, 0.0)
 
@@ -245,10 +281,11 @@ class SrbdMpc:
         self.apply_kinematic_constraints(planner_tick)
         
         # Target per il piede che atterrerà (p_swing)
+        plan_to_use = nominal_plan if nominal_plan is not None else self.footstep_planner.plan
         try:
-            next_step_target = self.footstep_planner.plan[current_step_index + 1]['pos'][0:2]
+            next_step_target = plan_to_use[current_step_index + 1]['pos'][0:2]
         except IndexError:
-            next_step_target = self.footstep_planner.plan[current_step_index]['pos'][0:2]  
+            next_step_target = plan_to_use[current_step_index]['pos'][0:2]  
         cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
         
         self.opt.minimize(cost)
@@ -259,6 +296,7 @@ class SrbdMpc:
             # Salvare per Warm Start e Buffering
             self.last_X = sol.value(self.X)
             self.last_U = sol.value(self.U)
+            self.last_p_swing = sol.value(self.p_swing)
             
             optimal_controls = self.last_U[:, 0]
             target_state = self.extract_target_state(sol)
@@ -268,6 +306,7 @@ class SrbdMpc:
             self.opt.debug.show_infeasibilities()
 
             optimal_controls = np.zeros(24)
+            self.last_p_swing = next_step_target
             fz_each = (self.mass * abs(self.g[2])) / 8.0
             for i in range(8):
                 optimal_controls[i*3 + 2] = fz_each
@@ -304,7 +343,7 @@ class SrbdMpc:
             step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
             contact = self.footstep_planner.plan[step_idx]['foot_id']
             
-        return optimal_controls, target_state, contact
+        return optimal_controls, target_state, contact, self.last_p_swing
     
     
     def get_buffered_forces(self, tick_offset):

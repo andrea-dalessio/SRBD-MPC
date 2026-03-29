@@ -100,6 +100,11 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             self.params
             )
 
+        # record initial plan
+        self.initial_plan = copy.deepcopy(self.footstep_planner.plan)
+        self.nominal_plan = copy.deepcopy(self.footstep_planner.plan)
+        self.post_impact_plan = None
+
         # initialize logger and plots
         self.logger = Logger(self.initial)
         
@@ -116,15 +121,22 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         if self.time > 26.0:
             print("\n*** SIMULAZIONE COMPLETATA (26s) ***")
             print("Apertura Dashboard Grafici...")
+            if self.post_impact_plan is None:
+                self.post_impact_plan = copy.deepcopy(self.footstep_planner.plan)
+            self.logger.log_footsteps(self.initial_plan, self.post_impact_plan)
             self.logger.show_all_plots()
             sys.exit(0)
 
+        # Record post impact plan roughly 1s after impact
+        if self.time > 6.0 and self.post_impact_plan is None:
+            self.post_impact_plan = copy.deepcopy(self.footstep_planner.plan)
+
         # --- TEST DISTURBI ESTERNI (Robustezza SRBD-MPC) ---
-        #if 5.0 < self.time < 5.15:
-         #   # Spinta laterale forte sul busto: 100N sull'asse Y negativo
-         #   self.torso.addExtForce([0.0, -100.0, 0.0], [0.0, 0.0, 0.0], isForceLocal=False, isOffsetLocal=True)
-          #  if round(self.time, 3) % 0.05 == 0:
-          #      print(f" [CRASH TEST] Impatto di -100N in corso! (t={self.time:.2f})")
+        if 5.0 < self.time < 5.15:
+            # Spinta laterale forte sul busto: 100N sull'asse Y negativo
+            self.torso.addExtForce([0.0, 50.0, 0.0], [0.0, 0.0, 0.0], isForceLocal=False, isOffsetLocal=True)
+            if round(self.time, 3) % 0.05 == 0:
+                print(f" [CRASH TEST] Impatto di 50N in corso! (t={self.time:.2f})")
 
         # 1. Calling control computation (MPC)
         if not hasattr(self, 'mpc_freq'):
@@ -134,8 +146,36 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         current_support = self.footstep_planner.plan[self.footstep_planner.get_step_index_at_time(planner_tick)]['foot_id']
         
         if self.mpc_tick_offset % self.mpc_freq == 0:
-            _, _, _ = self.mpc.compute_controls(self.current, self.time)
+            _, _, _, opt_p_swing = self.mpc.compute_controls(self.current, self.time, nominal_plan=self.nominal_plan)
+            
+            # Dynamic recovery: aggiorniamo il target del piede SOLO durante il volo (ss)
+            current_step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
+            current_phase = self.footstep_planner.get_phase_at_time(planner_tick)
+            if current_phase == 'ss' and current_step_idx is not None and current_step_idx + 1 < len(self.footstep_planner.plan):
+                self.footstep_planner.plan[current_step_idx + 1]['pos'][0] = opt_p_swing[0]
+                self.footstep_planner.plan[current_step_idx + 1]['pos'][1] = opt_p_swing[1]
+                
             self.mpc_tick_offset = 0
+
+        # Al touchdown (da ss a ds), propaghiamo l'offset di recupero come shift permanente per i prossimi passi
+        current_step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
+        phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
+        if hasattr(self, 'phase_prev') and self.phase_prev == 'ss' and phase_now == 'ds':
+            idx_landed = current_step_idx + 1
+            if current_step_idx is not None and idx_landed < len(self.nominal_plan):
+                final_pos = self.footstep_planner.plan[idx_landed]['pos'][:2]
+                nom_pos = self.nominal_plan[idx_landed]['pos'][:2]
+                shift = final_pos - nom_pos
+                
+                # Se c'è stato uno shift reale del piede per l'impatto (> 5mm) evitiamo l'incrocio gambe
+                if np.linalg.norm(shift) > 0.005: 
+                    for i in range(idx_landed + 1, len(self.nominal_plan)):
+                        self.nominal_plan[i]['pos'][0] += shift[0]
+                        self.nominal_plan[i]['pos'][1] += shift[1]
+                        self.footstep_planner.plan[i]['pos'][0] += shift[0]
+                        self.footstep_planner.plan[i]['pos'][1] += shift[1]
+                        
+        self.phase_prev = phase_now
 
         optimal_forces = self.mpc.get_buffered_forces(self.mpc_tick_offset)
         target_state = self.mpc.get_buffered_state(self.mpc_tick_offset)
@@ -323,4 +363,7 @@ if __name__ == "__main__":
                                  [0.,  0., 1. ])
     viewer.run()
     
+    if node.post_impact_plan is None:
+        node.post_impact_plan = copy.deepcopy(node.footstep_planner.plan)
+    node.logger.log_footsteps(node.initial_plan, node.post_impact_plan)
     node.logger.show_all_plots()
