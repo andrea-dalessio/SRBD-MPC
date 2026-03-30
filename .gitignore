@@ -1,1 +1,3 @@
-srbd_env/
+.venv/
+.vscode/
+**/__pycache__/
