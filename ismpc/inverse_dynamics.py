@@ -87,10 +87,10 @@ class InverseDynamics:
         # 4. TUNING PESI E GUADAGNI (Aggiornati per SRBD)
         tasks = ['lfoot', 'rfoot', 'com', 'torso', 'base', 'joints']
 
-        weights = {'lfoot': 5., 'rfoot': 5., 'com': 10., 'torso': 2.0, 'base': 2.0, 'joints': 1.0}
+        weights = {'lfoot': 5., 'rfoot': 5., 'com': 10., 'torso': 1.5, 'base': 2.0, 'joints': 1.0}
 
-        pos_gains = {'lfoot': 500., 'rfoot': 500., 'com': 100., 'torso': 50., 'base': 50., 'joints': 50.0}
-        vel_gains = {'lfoot': 60., 'rfoot': 60., 'com': 20., 'torso': 10., 'base': 10., 'joints': 5.0}
+        pos_gains = {'lfoot': 500., 'rfoot': 500., 'com': 100., 'torso': 30., 'base': 50., 'joints': 50.0}
+        vel_gains = {'lfoot': 60., 'rfoot': 60., 'com': 20., 'torso': 12., 'base': 10., 'joints': 5.0}
         
         W_force_track = 1.0
 

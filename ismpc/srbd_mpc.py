@@ -161,8 +161,8 @@ class SrbdMpc:
         W_com_z = 5000
         W_com_xy = 100
         W_vel = np.diag([1.0, 1.0, 5.0])
-        W_quat = np.diag([20.0, 20.0, 20.0])
-        W_omega = np.diag([5.0, 5.0, 5.0])
+        W_quat = np.diag([15.0, 15.0, 5.0])
+        W_omega = np.diag([3.0, 3.0, 3.0])
         W_force = np.eye(24) * 1e-6
         W_swing = 500.0
         W_quat_norm = 100.0
@@ -272,7 +272,18 @@ class SrbdMpc:
             
             # Regolarizzazioni (Velocità, Orientamento, Omega)
             cost += cs.mtimes([(self.X[3:6, k+1]).T, W_vel, self.X[3:6, k+1]])
-            cost += cs.mtimes([(self.X[7:10, k+1]).T, W_quat, self.X[7:10, k+1]])
+            
+            # Tracking dell'orientamento Yaw dinamico lungo la traiettoria
+            yaw_ref = (yaw_l_k + yaw_r_k) / 2.0
+            q_ref_w = cs.cos(yaw_ref / 2.0)
+            q_ref_z = cs.sin(yaw_ref / 2.0)
+            
+            # Penalizzazioni indipendenti: Roll e Pitch (fermi), Yaw (segue le orme)
+            cost += W_quat[0,0] * self.X[7, k+1]**2
+            cost += W_quat[1,1] * self.X[8, k+1]**2
+            q_dot_err = self.X[6, k+1]*q_ref_w + self.X[9, k+1]*q_ref_z
+            cost += W_quat[2,2] * (1.0 - q_dot_err**2)
+            
             cost += cs.mtimes([(self.X[10:13, k+1]).T, W_omega, self.X[10:13, k+1]])
             cost += W_quat_norm * (cs.sumsqr(self.X[6:10, k+1]) - 1.0)**2
             cost += cs.mtimes([u_k.T, W_force, u_k])
