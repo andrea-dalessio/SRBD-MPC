@@ -1,5 +1,6 @@
 import numpy as np
 from matplotlib import pyplot as plt
+import os
 
 class Logger():
     def __init__(self, initial):
@@ -8,6 +9,8 @@ class Logger():
             for level in initial[item].keys():
                 self.log['desired', item, level] = []
                 self.log['current', item, level] = []
+
+        self.log['disturbances'] = []
         
         self.initial_plan = None
         self.post_impact_plan = None
@@ -15,6 +18,14 @@ class Logger():
     def log_footsteps(self, initial_plan, post_impact_plan):
         self.initial_plan = initial_plan
         self.post_impact_plan = post_impact_plan
+
+    def log_disturbance(self, time_stamp, force_world, forward_xy, com_xy):
+        self.log['disturbances'].append({
+            'time': float(time_stamp),
+            'force': np.array(force_world, dtype=float),
+            'forward_xy': np.array(forward_xy, dtype=float),
+            'com_xy': np.array(com_xy, dtype=float)
+        })
 
 
     def log_data(self, desired, current, forces=None, commands=None):
@@ -33,11 +44,26 @@ class Logger():
                 self.log['commands'] = []
             self.log['commands'].append(commands)
 
-    def show_all_plots(self):
+    def show_all_plots(self, save_dir=None, show_plots=True):
         print("Visualizzazione dei grafici in corso...")
+        saved_files = []
+
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+
+        def save_figure(fig, filename):
+            if save_dir is None:
+                return
+            out_path = os.path.join(save_dir, filename)
+            fig.savefig(out_path, dpi=180, bbox_inches='tight')
+            saved_files.append(out_path)
         
         # Estrazione Dati
         com_des = np.array(self.log['desired', 'com', 'pos'])
+        if len(com_des) == 0:
+            print("Nessun campione disponibile nel logger.")
+            return saved_files
+
         com_cur = np.array(self.log['current', 'com', 'pos'])
         zmp_des = np.array(self.log['desired', 'zmp', 'pos'])
         zmp_cur = np.array(self.log['current', 'zmp', 'pos'])
@@ -106,6 +132,7 @@ class Logger():
         ax.grid(True)
 
         plt.tight_layout()
+        save_figure(fig, 'overview_tracking.png')
         
         # New figure for footsteps
         if hasattr(self, 'initial_plan') and self.initial_plan is not None:
@@ -115,7 +142,7 @@ class Logger():
             # Plotta i footprint iniziali
             for i, step in enumerate(self.initial_plan):
                 x, y, z = step['pos']
-                color = 'blue' if step['foot_id'] == 'lfoot' else 'blue'
+                color = 'tab:blue' if step['foot_id'] == 'lfoot' else 'tab:green'
                 ax2.plot(x, y, marker='s', markersize=30, color=color, alpha=0.2)
                 ax2.text(x, y, str(i), color=color, fontsize=14, ha='center', va='center', fontweight='bold')
 
@@ -126,12 +153,38 @@ class Logger():
                     ax2.plot(x, y, marker='s', markersize=30, markeredgecolor='red', markerfacecolor='none', linestyle='--', linewidth=3)
                     ax2.text(x, y+0.04, f"{i}'", color='red', fontsize=14, ha='center', va='center', fontweight='bold')
 
+            # Traiettoria CoM sulla mappa footsteps
+            ax2.plot(com_cur[:, 0], com_cur[:, 1], 'k-', linewidth=2.0, label='CoM Current')
+            ax2.plot(com_des[:, 0], com_des[:, 1], 'k--', linewidth=1.5, alpha=0.8, label='CoM Desired')
+
+            # Marker disturbi esterni applicati
+            if len(self.log['disturbances']) > 0:
+                for event in self.log['disturbances']:
+                    p = event['com_xy']
+                    f = event['force'][:2]
+                    fn = np.linalg.norm(f)
+                    if fn > 1e-8:
+                        f_dir = f / fn
+                        ax2.quiver(
+                            p[0],
+                            p[1],
+                            f_dir[0],
+                            f_dir[1],
+                            angles='xy',
+                            scale_units='xy',
+                            scale=8.0,
+                            color='tab:orange',
+                            width=0.006
+                        )
+
             ax2.set_xlabel('X (m)')
             ax2.set_ylabel('Y (m)')
             ax2.set_title('Confronto Traiettoria (Trasparente: nominale | Bordata Rossa: ri-pianificata)')
             ax2.grid(True)
             ax2.axis('equal')
+            ax2.legend(loc='best')
             fig2.tight_layout()
+            save_figure(fig2, 'footsteps_map.png')
 
         # New figure for Torso vs Feet Yaw
         fig3, ax3 = plt.subplots(figsize=(10, 5))
@@ -157,5 +210,16 @@ class Logger():
         ax3.grid(True)
         ax3.legend()
         fig3.tight_layout()
+        save_figure(fig3, 'yaw_tracking.png')
 
-        plt.show()
+        if len(saved_files) > 0:
+            print("Plot salvati come immagini:")
+            for path in saved_files:
+                print(f" - {path}")
+
+        if show_plots:
+            plt.show()
+        else:
+            plt.close('all')
+
+        return saved_files

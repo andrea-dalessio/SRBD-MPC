@@ -1,6 +1,7 @@
 import numpy as np
 import dartpy as dart
 import copy
+from datetime import datetime
 from utils import *
 import os
 import srbd_mpc
@@ -111,9 +112,153 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         # initialize logger and plots
         self.logger = Logger(self.initial)
+
+        self.shutdown_triggered = False
+        self.fall_com_height_threshold = 0.35
+        self.max_consecutive_mpc_failures = 8
+        self.mpc_fail_count = 0
+        self.disturbance = {
+            'enabled': True,
+            'start': 5.0,
+            'end': 5.15,
+            'magnitude': 50.0,
+            'leftward': True
+        }
+
+        self.run_metrics = {
+            'max_tau_nm': 0.0,
+            'min_com_height_m': float(self.initial['com']['pos'][2]),
+            'mpc_fallback_total': 0,
+            'wbc_fallback_total': 0,
+            'com_err_sum_m': 0.0,
+            'com_err_samples': 0
+        }
+
+        self.save_plots_as_images = True
+        self.show_plots_interactive = bool(os.environ.get('DISPLAY'))
+        self.plots_output_root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'plots'
+        )
+
+    def _print_run_report(self, reason):
+        com_samples = self.run_metrics['com_err_samples']
+        if com_samples > 0:
+            mean_com_err = self.run_metrics['com_err_sum_m'] / com_samples
+        else:
+            mean_com_err = float('nan')
+
+        print("\n*** RUN SUMMARY ***")
+        print(f"Reason: {reason}")
+        print(f"Simulated time: {self.time:.3f} s")
+        print(f"Max joint torque: {self.run_metrics['max_tau_nm']:.3f} Nm")
+        print(f"Min CoM height: {self.run_metrics['min_com_height_m']:.3f} m")
+        print(f"MPC fallback count: {self.run_metrics['mpc_fallback_total']}")
+        print(f"WBC fallback count: {self.run_metrics['wbc_fallback_total']}")
+        if np.isfinite(mean_com_err):
+            print(f"Mean CoM tracking error: {mean_com_err:.5f} m")
+        else:
+            print("Mean CoM tracking error: n/a (no valid samples)")
+
+    def _shutdown_with_plots(self, reason, exit_code=1):
+        if self.shutdown_triggered:
+            return
+        self.shutdown_triggered = True
+        print(f"\n*** TERMINAZIONE ANTICIPATA *** {reason}")
+        self._print_run_report(reason)
+        if self.post_impact_plan is None:
+            self.post_impact_plan = copy.deepcopy(self.footstep_planner.plan)
+        self.logger.log_footsteps(self.initial_plan, self.post_impact_plan)
+
+        save_dir = None
+        if self.save_plots_as_images:
+            run_tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+            save_dir = os.path.join(self.plots_output_root, f'run_{run_tag}')
+
+        self.logger.show_all_plots(
+            save_dir=save_dir,
+            show_plots=self.show_plots_interactive
+        )
+        raise SystemExit(exit_code)
+
+    def _is_finite_state(self, state):
+        finite_arrays = [
+            state['com']['pos'], state['com']['vel'],
+            state['base']['quat'], state['base']['omega'],
+            state['joint']['pos'], state['joint']['vel'],
+            state['lfoot']['pos'], state['rfoot']['pos']
+        ]
+        return all(np.all(np.isfinite(np.asarray(a))) for a in finite_arrays)
+
+    def _is_finite_target_state(self, target_state):
+        finite_arrays = [
+            target_state['com']['pos'], target_state['com']['vel'], target_state['com']['acc'],
+            target_state['base']['quat'], target_state['base']['omega']
+        ]
+        return all(np.all(np.isfinite(np.asarray(a))) for a in finite_arrays)
+
+    def _get_walking_direction_xy(self, planner_tick):
+        step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
+        if step_idx is None:
+            return np.array([1.0, 0.0])
+
+        p0 = self.footstep_planner.plan[step_idx]['pos'][0:2]
+        next_idx = min(step_idx + 1, len(self.footstep_planner.plan) - 1)
+        p1 = self.footstep_planner.plan[next_idx]['pos'][0:2]
+        forward = p1 - p0
+
+        if np.linalg.norm(forward) < 1e-6:
+            forward = np.array(self.current['com']['vel'][0:2])
+        if np.linalg.norm(forward) < 1e-6:
+            forward = np.array([1.0, 0.0])
+
+        return forward / np.linalg.norm(forward)
+
+    def _apply_lateral_disturbance(self, planner_tick):
+        if not self.disturbance['enabled']:
+            return
+        if not (self.disturbance['start'] < self.time < self.disturbance['end']):
+            return
+
+        forward_xy = self._get_walking_direction_xy(planner_tick)
+        lateral_xy = np.array([-forward_xy[1], forward_xy[0]])
+        side = 1.0 if self.disturbance['leftward'] else -1.0
+        force_xy = side * self.disturbance['magnitude'] * lateral_xy
+        ext_force = np.array([force_xy[0], force_xy[1], 0.0])
+
+        self.torso.addExtForce(ext_force, [0.0, 0.0, 0.0], isForceLocal=False, isOffsetLocal=False)
+        self.logger.log_disturbance(self.time, ext_force, forward_xy, self.current['com']['pos'][0:2])
+
+        if round(self.time, 3) % 0.05 == 0:
+            orthogonality = np.dot(forward_xy, force_xy) / (np.linalg.norm(force_xy) + 1e-9)
+            print(
+                f" [CRASH TEST] Disturbo laterale applicato | t={self.time:.2f}s "
+                f"| F=[{ext_force[0]:.2f}, {ext_force[1]:.2f}, 0.00]N "
+                f"| dot(forward,force)={orthogonality:.4f}"
+            )
         
     def customPreStep(self):
-        self.current = self.retrieve_state() # Get current state from the simulation
+        try:
+            self.current = self.retrieve_state() # Get current state from the simulation
+        except Exception as exc:
+            self._shutdown_with_plots(f"Errore nel retrieve_state: {exc}")
+            return
+
+        if not self._is_finite_state(self.current):
+            self._shutdown_with_plots("Stato non finito rilevato (NaN/Inf) prima del controllo")
+            return
+
+        if self.current['com']['pos'][2] < self.fall_com_height_threshold:
+            self._shutdown_with_plots(
+                f"Caduta rilevata: altezza CoM={self.current['com']['pos'][2]:.3f} m"
+            )
+            return
+
+        self.run_metrics['min_com_height_m'] = min(
+            self.run_metrics['min_com_height_m'],
+            float(self.current['com']['pos'][2])
+        )
+
         planner_tick = int(round(self.time / self.params['world_time_step']))
 
         # Arm swinging logic (opposto alle gambe)
@@ -133,36 +278,44 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         print(self.current['inertia'])
         print("--------------------")
 
-        import sys
         if self.time > 26.0:
-            print("\n*** SIMULAZIONE COMPLETATA (26s) ***")
-            print("Apertura Dashboard Grafici...")
-            if self.post_impact_plan is None:
-                self.post_impact_plan = copy.deepcopy(self.footstep_planner.plan)
-            self.logger.log_footsteps(self.initial_plan, self.post_impact_plan)
-            self.logger.show_all_plots()
-            sys.exit(0)
+            self._shutdown_with_plots("Simulazione completata (26s)", exit_code=0)
+            return
 
         # Record post impact plan roughly 1s after impact
         if self.time > 6.0 and self.post_impact_plan is None:
             self.post_impact_plan = copy.deepcopy(self.footstep_planner.plan)
 
         # --- TEST DISTURBI ESTERNI (Robustezza SRBD-MPC) ---
-        if 5.0 < self.time < 5.15:
-            # Spinta laterale forte sul busto: 100N sull'asse Y negativo
-            self.torso.addExtForce([0.0, 50.0, 0.0], [0.0, 0.0, 0.0], isForceLocal=False, isOffsetLocal=True)
-            if round(self.time, 3) % 0.05 == 0:
-                print(f" [CRASH TEST] Impatto di 50N in corso! (t={self.time:.2f})")
+        self._apply_lateral_disturbance(planner_tick)
 
         # 1. Calling control computation (MPC)
         if not hasattr(self, 'mpc_freq'):
             self.mpc_freq = 5 # 20 Hz
             self.mpc_tick_offset = 0
-
-        current_support = self.footstep_planner.plan[self.footstep_planner.get_step_index_at_time(planner_tick)]['foot_id']
         
         if self.mpc_tick_offset % self.mpc_freq == 0:
-            _, _, _, opt_p_swing = self.mpc.compute_controls(self.current, self.time, nominal_plan=self.nominal_plan)
+            try:
+                _, _, _, opt_p_swing = self.mpc.compute_controls(
+                    self.current,
+                    self.time,
+                    nominal_plan=self.nominal_plan
+                )
+            except Exception as exc:
+                self._shutdown_with_plots(f"Eccezione MPC non gestita: {exc}")
+                return
+
+            if self.mpc.last_solve_success:
+                self.mpc_fail_count = 0
+            else:
+                self.mpc_fail_count += 1
+                self.run_metrics['mpc_fallback_total'] += 1
+                print(f"[MPC] Solve fallito ({self.mpc_fail_count} consecutivi): {self.mpc.last_solve_message}")
+                if self.mpc_fail_count >= self.max_consecutive_mpc_failures:
+                    self._shutdown_with_plots(
+                        f"Arresto preventivo: {self.mpc_fail_count} failure MPC consecutive"
+                    )
+                    return
             
             # Dynamic recovery: aggiorniamo il target del piede SOLO durante il volo (ss)
             current_step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
@@ -195,6 +348,14 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         optimal_forces = self.mpc.get_buffered_forces(self.mpc_tick_offset)
         target_state = self.mpc.get_buffered_state(self.mpc_tick_offset)
+        if target_state is None or not self._is_finite_target_state(target_state):
+            self._shutdown_with_plots("Target MPC non valido (None/NaN)")
+            return
+
+        if not np.all(np.isfinite(np.asarray(optimal_forces))):
+            self._shutdown_with_plots("Forze MPC non finite")
+            return
+
         self.mpc_tick_offset += 1
         phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
         step_idx_now = self.footstep_planner.get_step_index_at_time(planner_tick)
@@ -210,6 +371,10 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.desired['com']['pos'] = target_state['com']['pos']
         self.desired['com']['vel'] = target_state['com']['vel']
         self.desired['com']['acc'] = target_state['com']['acc']
+        com_err = np.linalg.norm(self.desired['com']['pos'] - self.current['com']['pos'])
+        if np.isfinite(com_err):
+            self.run_metrics['com_err_sum_m'] += float(com_err)
+            self.run_metrics['com_err_samples'] += 1
 
         self.desired['zmp']['pos'] = self.current['zmp']['pos']
         self.desired['zmp']['vel'] = np.zeros(3)
@@ -238,10 +403,20 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.desired['torso']['acc'] = np.zeros(3)
 
         # 6. WBC computations (Inverse Dynamics)
-        commands = self.id.get_joint_torques(self.desired, self.current, swing_foot_id, optimal_forces)
+        commands, wbc_ok, wbc_msg = self.id.get_joint_torques(
+            self.desired,
+            self.current,
+            swing_foot_id,
+            optimal_forces
+        )
+        if not wbc_ok:
+            self.run_metrics['wbc_fallback_total'] += 1
+            self._shutdown_with_plots(f"Arresto preventivo WBC: {wbc_msg}")
+            return
         
         # Debug
         max_tau = np.max(np.abs(commands))
+        self.run_metrics['max_tau_nm'] = max(self.run_metrics['max_tau_nm'], float(max_tau))
         print(f"Time: {self.time} | Phase: {phase_now} | Swing Foot: {swing_foot_id}")
         print(f"Coppia max: {max_tau:.1f} Nm")
         print("-" * 20)
@@ -254,7 +429,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         current_for_log = copy.deepcopy(self.current)
         if 'inertia' in current_for_log:
             del current_for_log['inertia'] 
-        self.logger.log_data(current_for_log, self.desired, optimal_forces, commands)
+        self.logger.log_data(self.desired, current_for_log, optimal_forces, commands)
     
         self.time += self.params['world_time_step']
      

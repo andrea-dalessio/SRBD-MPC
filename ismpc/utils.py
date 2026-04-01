@@ -92,8 +92,13 @@ class QPSolver:
     def solve(self):
         try:
             solution = self.opti.solve()
-            x_sol = solution.value(self.x)
+            stats = self.opti.stats()
+            if stats.get('success') is False:
+                return None
+            x_sol = np.array(solution.value(self.x)).flatten()
+            if not np.all(np.isfinite(x_sol)):
+                return None
         except RuntimeError as e:
             print("QP Solver failed:", e)
-            x_sol = np.zeros(self.n_vars)
+            return None
         return x_sol

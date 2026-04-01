@@ -27,7 +27,18 @@ class InverseDynamics:
             if joint_name in redundant_dofs:
                 self.joint_selection[i, i] = 1
 
+    def _is_finite_structure(self, obj):
+        if isinstance(obj, dict):
+            return all(self._is_finite_structure(v) for v in obj.values())
+        arr = np.asarray(obj)
+        return np.all(np.isfinite(arr))
+
     def get_joint_torques(self, desired, current, swing_Foot, optimal_forces):
+        if not self._is_finite_structure(desired) or not self._is_finite_structure(current):
+            return np.zeros(self.dofs - 6), False, "Non-finite desired/current state in WBC"
+        if not np.all(np.isfinite(np.asarray(optimal_forces))):
+            return np.zeros(self.dofs - 6), False, "Non-finite optimal forces in WBC"
+
         # 1. Identificazione fasi di contatto (booleani numerici)
         contact_l = 1.0 if (swing_Foot == 'ds' or swing_Foot == 'rfoot') else 0.0
         contact_r = 1.0 if (swing_Foot == 'ds' or swing_Foot == 'lfoot') else 0.0
@@ -196,17 +207,28 @@ class InverseDynamics:
         A_ineq[:, f_c_indices] = block_diag(A_foot, A_foot)
 
         # 10. Risoluzione QP e Saturazione
+        if not (
+            np.all(np.isfinite(H)) and
+            np.all(np.isfinite(F)) and
+            np.all(np.isfinite(A_eq)) and
+            np.all(np.isfinite(b_eq)) and
+            np.all(np.isfinite(A_ineq)) and
+            np.all(np.isfinite(b_ineq))
+        ):
+            return np.zeros(self.dofs - 6), False, "Non-finite QP matrices in WBC"
+
         self.qp_solver.set_values(H, F, A_eq, b_eq, A_ineq, b_ineq)
         solution = self.qp_solver.solve()
+        if solution is None or not np.all(np.isfinite(solution)):
+            print("WBC QP Solver fallito! Restituisco coppie nulle per sicurezza.")
+            return np.zeros(self.dofs - 6), False, "WBC QP solver failed"
+
         print("solution fc:", solution[f_c_indices])
         print("solution tau max:", np.max(np.abs(solution[tau_indices])))
         print("==============================")
-        if solution is None:
-            print("WBC QP Solver fallito! Restituisco coppie nulle per sicurezza.")
-            return np.zeros(self.dofs - 6)
 
         tau = solution[tau_indices]
         joint_torques = tau[6:] 
         
        
-        return np.clip(joint_torques, -100.0, 100.0)
+        return np.clip(joint_torques, -100.0, 100.0), True, ""

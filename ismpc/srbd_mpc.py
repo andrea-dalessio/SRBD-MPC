@@ -21,6 +21,48 @@ class SrbdMpc:
         self.f = lambda x, u, p_contacts: self._get_dynamics_with_rot_inertia(x, u, p_contacts)
         self.last_X = None
         self.last_U = None
+        self.last_solve_success = True
+        self.last_solve_message = ""
+
+    def _is_finite_state(self, state):
+        state_arrays = [
+            state['com']['pos'],
+            state['com']['vel'],
+            state['base']['quat'],
+            state['base']['omega']
+        ]
+        return all(np.all(np.isfinite(np.asarray(arr))) for arr in state_arrays)
+
+    def _build_safe_fallback(self, current_state, next_step_target):
+        optimal_controls = np.zeros(24)
+        fz_each = (self.mass * abs(self.g[2])) / 8.0
+        for i in range(8):
+            optimal_controls[i*3 + 2] = fz_each
+
+        target_state = {
+            'com': {
+                'pos': current_state['com']['pos'].copy(),
+                'vel': current_state['com']['vel'].copy(),
+                'acc': np.zeros(3)
+            },
+            'base': {
+                'quat': current_state['base']['quat'].copy(),
+                'omega': current_state['base']['omega'].copy()
+            }
+        }
+
+        self.last_X = np.zeros((13, self.N + 1))
+        for k in range(self.N + 1):
+            self.last_X[0:3, k] = target_state['com']['pos']
+            self.last_X[6:10, k] = target_state['base']['quat']
+
+        self.last_U = np.zeros((24, self.N))
+        for k in range(self.N):
+            for i in range(8):
+                self.last_U[i*3 + 2, k] = fz_each
+
+        self.last_p_swing = np.array(next_step_target).copy()
+        return optimal_controls, target_state
 
     def _get_dynamics_with_rot_inertia(self, x, u, p_contacts):
         q = x[6:10]      
@@ -108,6 +150,32 @@ class SrbdMpc:
         
     def compute_controls(self, current_state, t, nominal_plan=None):
         planner_tick = int(round(t / self.delta))
+        current_step_index = self.footstep_planner.get_step_index_at_time(planner_tick)
+        if current_step_index is None:
+            current_step_index = len(self.footstep_planner.plan) - 1
+
+        if nominal_plan is not None:
+            plan_for_target = nominal_plan
+        else:
+            plan_for_target = self.footstep_planner.plan
+
+        try:
+            next_step_target = plan_for_target[current_step_index + 1]['pos'][0:2]
+        except IndexError:
+            next_step_target = plan_for_target[current_step_index]['pos'][0:2]
+
+        if not self._is_finite_state(current_state):
+            self.last_solve_success = False
+            self.last_solve_message = "MPC skipped due to non-finite current state"
+            optimal_controls, target_state = self._build_safe_fallback(current_state, next_step_target)
+            phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
+            if phase_now == 'ds':
+                contact = 'ds'
+            else:
+                step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
+                contact = self.footstep_planner.plan[step_idx]['foot_id']
+            return optimal_controls, target_state, contact, self.last_p_swing
+
         #  Inizializzazione Problema di Ottimizzazione
         self.opt = cs.Opti()
         self.X = self.opt.variable(13, self.N + 1) 
@@ -153,7 +221,6 @@ class SrbdMpc:
         )
         self.opt.subject_to(self.X[:, 0] == x0)
         
-        current_step_index = self.footstep_planner.get_step_index_at_time(planner_tick)
         current_support = self.footstep_planner.plan[current_step_index]['foot_id']
         
         #  TUNING PESI 
@@ -292,17 +359,14 @@ class SrbdMpc:
         self.apply_kinematic_constraints(planner_tick)
         
         # Target per il piede che atterrerà (p_swing)
-        plan_to_use = nominal_plan if nominal_plan is not None else self.footstep_planner.plan
-        try:
-            next_step_target = plan_to_use[current_step_index + 1]['pos'][0:2]
-        except IndexError:
-            next_step_target = plan_to_use[current_step_index]['pos'][0:2]  
         cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
         
         self.opt.minimize(cost)
         
         try:
             sol = self.opt.solve()
+            self.last_solve_success = True
+            self.last_solve_message = ""
             
             # Salvare per Warm Start e Buffering
             self.last_X = sol.value(self.X)
@@ -313,36 +377,15 @@ class SrbdMpc:
             target_state = self.extract_target_state(sol)
             print(f"--- STEP {t} --- [V] IPOPT | Iters: {self.opt.stats()['iter_count']}")
         except Exception as e:
+            self.last_solve_success = False
+            self.last_solve_message = str(e)
             print(f"--- STEP {t} --- [X] IPOPT FALLITO!")
-            self.opt.debug.show_infeasibilities()
+            try:
+                self.opt.debug.show_infeasibilities()
+            except Exception:
+                pass
 
-            optimal_controls = np.zeros(24)
-            self.last_p_swing = next_step_target
-            fz_each = (self.mass * abs(self.g[2])) / 8.0
-            for i in range(8):
-                optimal_controls[i*3 + 2] = fz_each
-
-            target_state = {
-                'com': {
-                    'pos': current_state['com']['pos'].copy(),
-                    'vel': current_state['com']['vel'].copy(),
-                    'acc': np.zeros(3)
-                },
-                'base': {
-                    'quat': current_state['base']['quat'].copy(),
-                    'omega': current_state['base']['omega'].copy()
-                }
-            }
-            
-            # Setup buffer per get_buffered salvandoli come fallback
-            self.last_X = np.zeros((13, self.N + 1))
-            for k in range(self.N + 1):
-                self.last_X[0:3, k] = target_state['com']['pos']
-                self.last_X[6:10, k] = target_state['base']['quat']
-            self.last_U = np.zeros((24, self.N))
-            for k in range(self.N):
-                for i in range(8):
-                    self.last_U[i*3 + 2, k] = fz_each
+            optimal_controls, target_state = self._build_safe_fallback(current_state, next_step_target)
         
         fz_tot = sum(optimal_controls[i*3 + 2] for i in range(8))
         print(f"Forza Z Totale: {fz_tot:.1f} N | Coppia Max: {np.max(np.abs(optimal_controls)):.1f}")

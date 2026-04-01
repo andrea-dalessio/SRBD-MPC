@@ -8,7 +8,7 @@ class FootstepPlanner:
 
         unicycle_pos   = (initial_lfoot[3:5] + initial_rfoot[3:5]) / 2.
         unicycle_theta = (initial_lfoot[2]   + initial_rfoot[2]  ) / 2.
-        support_foot   = params['first_swing']
+        support_foot = 'lfoot' if params['first_swing'] == 'rfoot' else 'rfoot'
         self.plan = []
 
         for j in range(len(vref)):
@@ -59,7 +59,7 @@ class FootstepPlanner:
         for i in range(len(self.plan)):
             t += self.plan[i]['ss_duration'] + self.plan[i]['ds_duration']
             if t > time: return i
-        return None
+        return len(self.plan) - 1
 
     def get_start_time(self, step_index):
         t = 0
