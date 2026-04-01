@@ -133,4 +133,29 @@ class Logger():
             ax2.axis('equal')
             fig2.tight_layout()
 
+        # New figure for Torso vs Feet Yaw
+        fig3, ax3 = plt.subplots(figsize=(10, 5))
+        fig3.suptitle('Torso Yaw vs Feet Yaw Tracking', fontsize=14)
+        
+        w, x, y, z = quat_cur[:, 0], quat_cur[:, 1], quat_cur[:, 2], quat_cur[:, 3]
+        base_yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y**2 + z**2))
+        
+        lfoot_cur = np.array(self.log['current', 'lfoot', 'pos'])
+        rfoot_cur = np.array(self.log['current', 'rfoot', 'pos'])
+        lfoot_yaw = lfoot_cur[:, 2]
+        rfoot_yaw = rfoot_cur[:, 2]
+        avg_feet_yaw = (lfoot_yaw + rfoot_yaw) / 2.0
+        
+        ax3.plot(time_steps, base_yaw, 'b-', linewidth=2, label='Torso Yaw (Current)')
+        ax3.plot(time_steps, avg_feet_yaw, 'k--', linewidth=2, label='Average Feet Yaw (Target)')
+        ax3.plot(time_steps, lfoot_yaw, 'g-', alpha=0.5, label='Left Foot Yaw')
+        ax3.plot(time_steps, rfoot_yaw, 'r-', alpha=0.5, label='Right Foot Yaw')
+        
+        ax3.set_xlabel('Time Steps')
+        ax3.set_ylabel('Yaw (Radians)')
+        ax3.set_title('Confronto Orientamento Torso e Piedi')
+        ax3.grid(True)
+        ax3.legend()
+        fig3.tight_layout()
+
         plt.show()

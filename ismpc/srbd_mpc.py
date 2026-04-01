@@ -161,7 +161,7 @@ class SrbdMpc:
         W_com_z = 5000
         W_com_xy = 100
         W_vel = np.diag([1.0, 1.0, 5.0])
-        W_quat = np.diag([15.0, 15.0, 5.0])
+        W_quat = np.diag([15.0, 15.0, 100.0])
         W_omega = np.diag([3.0, 3.0, 3.0])
         W_force = np.eye(24) * 1e-6
         W_swing = 500.0

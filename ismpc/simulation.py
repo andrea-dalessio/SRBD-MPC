@@ -76,6 +76,10 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         
         # initialize inverse dynamics
         self.id = id.InverseDynamics(self.hrp4, redundant_dofs)
+        
+        # Shoulder Indices for Arm Swing
+        self.r_shoulder_p_idx = self.hrp4.getDof('R_SHOULDER_P').getIndexInSkeleton()
+        self.l_shoulder_p_idx = self.hrp4.getDof('L_SHOULDER_P').getIndexInSkeleton()
 
         # initialize footstep planner
         reference = [(0.1, 0., 0.2)] * 5 + [(0.1, 0., -0.1)] * 10 + [(0.1, 0., 0.)] * 10
@@ -111,6 +115,18 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
     def customPreStep(self):
         self.current = self.retrieve_state() # Get current state from the simulation
         planner_tick = int(round(self.time / self.params['world_time_step']))
+
+        # Arm swinging logic (opposto alle gambe)
+        l_foot_x = self.current['lfoot']['pos'][3] # Index 3 is X translation
+        r_foot_x = self.current['rfoot']['pos'][3]
+        leg_diff_x = l_foot_x - r_foot_x
+        
+        arm_swing_gain = 1.5 # Gain mappings 
+        base_shoulder_pitch = 4.0 * np.pi / 180.0
+        
+        arm_offset = np.clip(arm_swing_gain * leg_diff_x, -0.45, 0.45)
+        self.desired['joint']['pos'][self.r_shoulder_p_idx] = base_shoulder_pitch - arm_offset
+        self.desired['joint']['pos'][self.l_shoulder_p_idx] = base_shoulder_pitch + arm_offset
 
         self.current['inertia'] = self.base.getInertia().getMoment()
         print("inertia used by MPC:")
