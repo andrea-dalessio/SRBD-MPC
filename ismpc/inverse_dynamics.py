@@ -3,11 +3,53 @@ import numpy as np
 from utils import *
 
 class InverseDynamics:
-    def __init__(self, robot, redundant_dofs, foot_size=0.1, µ=0.5):
+    def __init__(
+        self,
+        robot,
+        redundant_dofs,
+        foot_size=0.1,
+        µ=0.5,
+        control_dt=0.01,
+        protected_joint_deviation_deg=None,
+        enable_protected_joint_constraints=False
+    ):
         self.robot = robot
         self.dofs = self.robot.getNumDofs()
         self.d = foot_size / 2.
         self.µ = µ
+        self.control_dt = control_dt
+
+        if protected_joint_deviation_deg is None:
+            protected_joint_deviation_deg = {
+                'NECK_Y': 18.0,
+                'NECK_P': 16.0,
+                'R_SHOULDER_P': 50.0,
+                'R_SHOULDER_R': 40.0,
+                'R_SHOULDER_Y': 45.0,
+                'R_ELBOW_P': 65.0,
+                'L_SHOULDER_P': 50.0,
+                'L_SHOULDER_R': 40.0,
+                'L_SHOULDER_Y': 45.0,
+                'L_ELBOW_P': 65.0
+            }
+
+        self.protected_joint_constraints = []
+        if enable_protected_joint_constraints:
+            q_lower = self.robot.getPositionLowerLimits()
+            q_upper = self.robot.getPositionUpperLimits()
+            q_nominal = self.robot.getPositions()
+
+            for joint_name, max_dev_deg in protected_joint_deviation_deg.items():
+                try:
+                    dof_idx = self.robot.getDof(joint_name).getIndexInSkeleton()
+                except Exception:
+                    continue
+
+                dev = np.deg2rad(max_dev_deg)
+                q_min = max(q_lower[dof_idx], q_nominal[dof_idx] - dev)
+                q_max = min(q_upper[dof_idx], q_nominal[dof_idx] + dev)
+                if q_min < q_max:
+                    self.protected_joint_constraints.append((dof_idx, q_min, q_max, joint_name))
 
         # define sizes for QP solver
         self.num_contacts = 2
@@ -15,7 +57,9 @@ class InverseDynamics:
         self.n_vars = 2 * self.dofs + self.num_contact_dims
 
         self.n_eq_constraints = self.dofs
-        self.n_ineq_constraints = 9 * self.num_contacts
+        self.n_contact_ineq_constraints = 9 * self.num_contacts
+        self.n_joint_ineq_constraints = 2 * len(self.protected_joint_constraints)
+        self.n_ineq_constraints = self.n_contact_ineq_constraints + self.n_joint_ineq_constraints
 
         # initialize QP solver
         self.qp_solver = QPSolver(self.n_vars, self.n_eq_constraints, self.n_ineq_constraints)
@@ -98,10 +142,10 @@ class InverseDynamics:
         # 4. TUNING PESI E GUADAGNI (Aggiornati per SRBD)
         tasks = ['lfoot', 'rfoot', 'com', 'torso', 'base', 'joints']
 
-        weights = {'lfoot': 5., 'rfoot': 5., 'com': 10., 'torso': 1.5, 'base': 2.0, 'joints': 1.0}
+        weights = {'lfoot': 5., 'rfoot': 5., 'com': 10., 'torso': 4.0, 'base': 2.0, 'joints': 4.5}
 
-        pos_gains = {'lfoot': 500., 'rfoot': 500., 'com': 100., 'torso': 30., 'base': 50., 'joints': 50.0}
-        vel_gains = {'lfoot': 60., 'rfoot': 60., 'com': 20., 'torso': 12., 'base': 10., 'joints': 5.0}
+        pos_gains = {'lfoot': 500., 'rfoot': 500., 'com': 100., 'torso': 80., 'base': 50., 'joints': 90.0}
+        vel_gains = {'lfoot': 60., 'rfoot': 60., 'com': 20., 'torso': 20., 'base': 10., 'joints': 14.0}
         
         W_force_track = 1.0
 
@@ -204,7 +248,28 @@ class InverseDynamics:
             [ 0, 0, 0, 0, 1, -self.µ], [  0, 0, 0, 0, -1, -self.µ], # Attrito Y
             [ 0, 0, 0, 0, 0, -1.0]                                  # f_z >= 0 -> -f_z <= 0
         ])
-        A_ineq[:, f_c_indices] = block_diag(A_foot, A_foot)
+        A_ineq[:self.n_contact_ineq_constraints, f_c_indices] = block_diag(A_foot, A_foot)
+
+        # 9b. Vincoli hard di postura: limiti su q_{k+1} per testa e braccia
+        # q_{k+1} = q + dt*q_dot + 0.5*dt^2*q_ddot
+        if self.n_joint_ineq_constraints > 0:
+            dt = self.control_dt
+            start_row = self.n_contact_ineq_constraints
+            for j, (dof_idx, q_min, q_max, _) in enumerate(self.protected_joint_constraints):
+                q_now = current['joint']['pos'][dof_idx]
+                qd_now = current['joint']['vel'][dof_idx]
+
+                qdd_max = 2.0 * (q_max - q_now - dt * qd_now) / (dt * dt)
+                qdd_min = 2.0 * (q_min - q_now - dt * qd_now) / (dt * dt)
+
+                row_up = start_row + 2 * j
+                row_low = row_up + 1
+
+                A_ineq[row_up, dof_idx] = 1.0
+                b_ineq[row_up] = qdd_max
+
+                A_ineq[row_low, dof_idx] = -1.0
+                b_ineq[row_low] = -qdd_min
 
         # 10. Risoluzione QP e Saturazione
         if not (

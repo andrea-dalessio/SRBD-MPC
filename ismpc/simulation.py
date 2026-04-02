@@ -57,6 +57,19 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         for joint_name, value in initial_configuration.items():
             self.hrp4.setPosition(self.hrp4.getDof(joint_name).getIndexInSkeleton(), value * np.pi / 180.)
 
+        # Bound torso-pelvis relative rotation to keep impact distribution natural.
+        chest_limits_deg = {'CHEST_Y': 35.0, 'CHEST_P': 35.0}
+        q_lower = self.hrp4.getPositionLowerLimits()
+        q_upper = self.hrp4.getPositionUpperLimits()
+        q_nominal = self.hrp4.getPositions()
+        for joint_name, max_dev_deg in chest_limits_deg.items():
+            dof_idx = self.hrp4.getDof(joint_name).getIndexInSkeleton()
+            dev = np.deg2rad(max_dev_deg)
+            q_lower[dof_idx] = max(q_lower[dof_idx], q_nominal[dof_idx] - dev)
+            q_upper[dof_idx] = min(q_upper[dof_idx], q_nominal[dof_idx] + dev)
+        self.hrp4.setPositionLowerLimits(q_lower)
+        self.hrp4.setPositionUpperLimits(q_upper)
+
         # position the robot on the ground
         lsole_pos = self.lsole.getTransform(withRespectTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World()).translation()
         rsole_pos = self.rsole.getTransform(withRespectTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World()).translation()
@@ -71,16 +84,37 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         # selection matrix for redundant dofs
         redundant_dofs = [ \
+            "CHEST_Y", "CHEST_P", \
             "NECK_Y", "NECK_P", \
             "R_SHOULDER_P", "R_SHOULDER_R", "R_SHOULDER_Y", "R_ELBOW_P", \
             "L_SHOULDER_P", "L_SHOULDER_R", "L_SHOULDER_Y", "L_ELBOW_P"]
         
-        # initialize inverse dynamics
-        self.id = id.InverseDynamics(self.hrp4, redundant_dofs)
+        # initialize inverse dynamics (strict + relaxed fallback)
+        # Strict profile keeps hard bounds only on neck for feasibility.
+        # Chest regulation is handled as a strong soft joint task.
+        protected_joint_cfg = {
+            'NECK_Y': 16.0,
+            'NECK_P': 14.0
+        }
+        self.id_strict = id.InverseDynamics(
+            self.hrp4,
+            redundant_dofs,
+            control_dt=self.params['world_time_step'],
+            protected_joint_deviation_deg=protected_joint_cfg,
+            enable_protected_joint_constraints=True
+        )
+        self.id_relaxed = id.InverseDynamics(
+            self.hrp4,
+            redundant_dofs,
+            control_dt=self.params['world_time_step'],
+            enable_protected_joint_constraints=False
+        )
         
         # Shoulder Indices for Arm Swing
         self.r_shoulder_p_idx = self.hrp4.getDof('R_SHOULDER_P').getIndexInSkeleton()
         self.l_shoulder_p_idx = self.hrp4.getDof('L_SHOULDER_P').getIndexInSkeleton()
+        self.chest_y_idx = self.hrp4.getDof('CHEST_Y').getIndexInSkeleton()
+        self.chest_p_idx = self.hrp4.getDof('CHEST_P').getIndexInSkeleton()
 
         # initialize footstep planner
         reference = [(0.1, 0., 0.2)] * 5 + [(0.1, 0., -0.1)] * 10 + [(0.1, 0., 0.)] * 10
@@ -130,6 +164,9 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             'min_com_height_m': float(self.initial['com']['pos'][2]),
             'mpc_fallback_total': 0,
             'wbc_fallback_total': 0,
+            'wbc_relaxed_recovery_total': 0,
+            'max_chest_y_deg': 0.0,
+            'max_chest_p_deg': 0.0,
             'com_err_sum_m': 0.0,
             'com_err_samples': 0
         }
@@ -155,6 +192,9 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         print(f"Min CoM height: {self.run_metrics['min_com_height_m']:.3f} m")
         print(f"MPC fallback count: {self.run_metrics['mpc_fallback_total']}")
         print(f"WBC fallback count: {self.run_metrics['wbc_fallback_total']}")
+        print(f"WBC strict->relaxed recoveries: {self.run_metrics['wbc_relaxed_recovery_total']}")
+        print(f"Max |CHEST_Y|: {self.run_metrics['max_chest_y_deg']:.2f} deg")
+        print(f"Max |CHEST_P|: {self.run_metrics['max_chest_p_deg']:.2f} deg")
         if np.isfinite(mean_com_err):
             print(f"Mean CoM tracking error: {mean_com_err:.5f} m")
         else:
@@ -198,14 +238,11 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         return all(np.all(np.isfinite(np.asarray(a))) for a in finite_arrays)
 
     def _get_walking_direction_xy(self, planner_tick):
-        step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
-        if step_idx is None:
-            return np.array([1.0, 0.0])
-
-        p0 = self.footstep_planner.plan[step_idx]['pos'][0:2]
-        next_idx = min(step_idx + 1, len(self.footstep_planner.plan) - 1)
-        p1 = self.footstep_planner.plan[next_idx]['pos'][0:2]
-        forward = p1 - p0
+        # Use robot heading (base x-axis projected on ground) so left/right
+        # disturbance is truly relative to the robot frame.
+        _ = planner_tick
+        base_rot = self.current['base']['pos']
+        forward = np.array([base_rot[0, 0], base_rot[1, 0]])
 
         if np.linalg.norm(forward) < 1e-6:
             forward = np.array(self.current['com']['vel'][0:2])
@@ -229,12 +266,12 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.torso.addExtForce(ext_force, [0.0, 0.0, 0.0], isForceLocal=False, isOffsetLocal=False)
         self.logger.log_disturbance(self.time, ext_force, forward_xy, self.current['com']['pos'][0:2])
 
-        if round(self.time, 3) % 0.05 == 0:
+        if planner_tick % 5 == 0:
             orthogonality = np.dot(forward_xy, force_xy) / (np.linalg.norm(force_xy) + 1e-9)
             print(
                 f" [CRASH TEST] Disturbo laterale applicato | t={self.time:.2f}s "
                 f"| F=[{ext_force[0]:.2f}, {ext_force[1]:.2f}, 0.00]N "
-                f"| dot(forward,force)={orthogonality:.4f}"
+                f"| frame=robot-left | dot(forward,force)={orthogonality:.4f}"
             )
         
     def customPreStep(self):
@@ -258,6 +295,11 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             self.run_metrics['min_com_height_m'],
             float(self.current['com']['pos'][2])
         )
+
+        chest_y_deg = float(np.rad2deg(self.current['joint']['pos'][self.chest_y_idx]))
+        chest_p_deg = float(np.rad2deg(self.current['joint']['pos'][self.chest_p_idx]))
+        self.run_metrics['max_chest_y_deg'] = max(self.run_metrics['max_chest_y_deg'], abs(chest_y_deg))
+        self.run_metrics['max_chest_p_deg'] = max(self.run_metrics['max_chest_p_deg'], abs(chest_p_deg))
 
         planner_tick = int(round(self.time / self.params['world_time_step']))
 
@@ -403,12 +445,28 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.desired['torso']['acc'] = np.zeros(3)
 
         # 6. WBC computations (Inverse Dynamics)
-        commands, wbc_ok, wbc_msg = self.id.get_joint_torques(
+        commands, wbc_ok, wbc_msg = self.id_strict.get_joint_torques(
             self.desired,
             self.current,
             swing_foot_id,
             optimal_forces
         )
+
+        if not wbc_ok:
+            relaxed_commands, relaxed_ok, relaxed_msg = self.id_relaxed.get_joint_torques(
+                self.desired,
+                self.current,
+                swing_foot_id,
+                optimal_forces
+            )
+            if relaxed_ok:
+                commands = relaxed_commands
+                wbc_ok = True
+                self.run_metrics['wbc_relaxed_recovery_total'] += 1
+                print(f"[WARN] WBC strict failed, fallback to relaxed succeeded: {wbc_msg}")
+            else:
+                wbc_msg = f"strict: {wbc_msg} | relaxed: {relaxed_msg}"
+
         if not wbc_ok:
             self.run_metrics['wbc_fallback_total'] += 1
             self._shutdown_with_plots(f"Arresto preventivo WBC: {wbc_msg}")
