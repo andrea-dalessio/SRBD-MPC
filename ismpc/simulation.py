@@ -58,7 +58,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             self.hrp4.setPosition(self.hrp4.getDof(joint_name).getIndexInSkeleton(), value * np.pi / 180.)
 
         # Bound torso-pelvis relative rotation to keep impact distribution natural.
-        chest_limits_deg = {'CHEST_Y': 35.0, 'CHEST_P': 35.0}
+        chest_limits_deg = {'CHEST_Y': 35.0, 'CHEST_P': 35.0} # Rotation limits YAW and PITCH
         q_lower = self.hrp4.getPositionLowerLimits()
         q_upper = self.hrp4.getPositionUpperLimits()
         q_nominal = self.hrp4.getPositions()
@@ -90,8 +90,9 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             "L_SHOULDER_P", "L_SHOULDER_R", "L_SHOULDER_Y", "L_ELBOW_P"]
         
         # initialize inverse dynamics (strict + relaxed fallback)
-        # Strict profile keeps hard bounds only on neck for feasibility.
-        # Chest regulation is handled as a strong soft joint task.
+        # When the "strict" profile is enabled, hard constraints on robot joints angles in the chest,
+        # neck and shoulder areas are enforced to prevent unnatural configurations and encourage more human-like recovery strategies.
+        # When not necessary, these constraints are lifted to allow the controller more freedom of operation.
         protected_joint_cfg = {
             'NECK_Y': 16.0,
             'NECK_P': 14.0
@@ -200,6 +201,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         else:
             print("Mean CoM tracking error: n/a (no valid samples)")
 
+    # Whenever the program reaches termination conditions (either falls, OSQP or IPOPT fails or actually
+    # completes the simulation) the program logs all the results and outputs them as graphs in the folder "plots"
     def _shutdown_with_plots(self, reason, exit_code=1):
         if self.shutdown_triggered:
             return
@@ -251,6 +254,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         return forward / np.linalg.norm(forward)
 
+    # The robot receives a lateral push when in "ss" phase, 5 seconds in. Total impulse = 7.5 Ns.
     def _apply_lateral_disturbance(self, planner_tick):
         if not self.disturbance['enabled']:
             return
@@ -303,7 +307,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         planner_tick = int(round(self.time / self.params['world_time_step']))
 
-        # Arm swinging logic (opposto alle gambe)
+        # Arm swinging logic
         l_foot_x = self.current['lfoot']['pos'][3] # Index 3 is X translation
         r_foot_x = self.current['rfoot']['pos'][3]
         leg_diff_x = l_foot_x - r_foot_x
@@ -328,12 +332,12 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         if self.time > 6.0 and self.post_impact_plan is None:
             self.post_impact_plan = copy.deepcopy(self.footstep_planner.plan)
 
-        # --- TEST DISTURBI ESTERNI (Robustezza SRBD-MPC) ---
+        # Apply the disturbance (push)
         self._apply_lateral_disturbance(planner_tick)
 
         # 1. Calling control computation (MPC)
         if not hasattr(self, 'mpc_freq'):
-            self.mpc_freq = 5 # 20 Hz
+            self.mpc_freq = 5 # 20 Hz. WBC runs at 5 times the speed.
             self.mpc_tick_offset = 0
         
         if self.mpc_tick_offset % self.mpc_freq == 0:
@@ -359,7 +363,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                     )
                     return
             
-            # Dynamic recovery: aggiorniamo il target del piede SOLO durante il volo (ss)
+            # Dynamic recovery: Foot target is updated ONLY DURING FLIGHT (ss)
             current_step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
             current_phase = self.footstep_planner.get_phase_at_time(planner_tick)
             if current_phase == 'ss' and current_step_idx is not None and current_step_idx + 1 < len(self.footstep_planner.plan):
@@ -368,7 +372,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 
             self.mpc_tick_offset = 0
 
-        # Al touchdown (da ss a ds), propaghiamo l'offset di recupero come shift permanente per i prossimi passi
+        # After landing, whichever shift was chosen for recovery is propagated to the rest of the footstep plan.
         current_step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
         phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
         if hasattr(self, 'phase_prev') and self.phase_prev == 'ss' and phase_now == 'ds':
@@ -378,7 +382,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 nom_pos = self.nominal_plan[idx_landed]['pos'][:2]
                 shift = final_pos - nom_pos
                 
-                # Se c'è stato uno shift reale del piede per l'impatto (> 5mm) evitiamo l'incrocio gambe
+                # Avoid crossing the legs!!
                 if np.linalg.norm(shift) > 0.005: 
                     for i in range(idx_landed + 1, len(self.nominal_plan)):
                         self.nominal_plan[i]['pos'][0] += shift[0]
@@ -493,10 +497,9 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
      
 
     def retrieve_state(self):
-        # 1. Posizioni e orientamenti 
+        # 1. Position and orientation of the robot (CoM, torso, base) 
         com_position = self.hrp4.getCOM()
         
-        # Recuperiamo le matrici di rotazione invece dei vettori
         torso_rot_matrix = self.hrp4.getBodyNode('torso').getTransform(
             withRespectTo=dart.dynamics.Frame.World(), 
             inCoordinatesOf=dart.dynamics.Frame.World()).rotation()
@@ -505,7 +508,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             withRespectTo=dart.dynamics.Frame.World(), 
             inCoordinatesOf=dart.dynamics.Frame.World()).rotation()
 
-        # 2. Pose dei piedi 
+        # 2. Feet pose 
         l_foot_transform = self.lsole.getTransform(withRespectTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         l_foot_orientation = get_rotvec(l_foot_transform.rotation())
         l_foot_position = l_foot_transform.translation()
@@ -516,7 +519,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         r_foot_position = r_foot_transform.translation()
         right_foot_pose = np.hstack((r_foot_orientation, r_foot_position))
 
-        # 3. Velocità
+        # 3. Velocities
         com_velocity = self.hrp4.getCOMLinearVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         torso_angular_velocity = self.hrp4.getBodyNode('torso').getAngularVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         base_angular_velocity = self.hrp4.getBodyNode('body').getAngularVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
@@ -524,7 +527,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         l_foot_spatial_velocity = self.lsole.getSpatialVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         r_foot_spatial_velocity = self.rsole.getSpatialVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
 
-        # 4. Calcolo forze di contatto e ZMP
+        # 4. Contact forces, zmp estimation
         force = np.zeros(3)
         collision_result = self.world.getLastCollisionResult()
         for contact in collision_result.getContacts():
@@ -540,11 +543,11 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 zmp[0] += (contact.point[0] * contact.force[2] / force[2] + (zmp[2] - contact.point[2]) * contact.force[0] / force[2])
                 zmp[1] += (contact.point[1] * contact.force[2] / force[2] + (zmp[2] - contact.point[2]) * contact.force[1] / force[2])
             
-            # Clipping per stabilità numerica
+            # Clipping
             midpoint = (l_foot_position + r_foot_position) / 2.
             zmp = np.clip(zmp, midpoint - 0.3, midpoint + 0.3)
         
-        # 5. Quaternioni e Omega
+        # 5. Quaternions
         quat_xyzw = R.from_matrix(base_rot_matrix).as_quat()
         quat_xyzw = quat_xyzw / np.linalg.norm(quat_xyzw)
         quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
@@ -552,7 +555,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         omega = self.base.getAngularVelocity(relativeTo=dart.dynamics.Frame.World(), 
                                      inCoordinatesOf=dart.dynamics.Frame.World())
         
-        # 6. Creazione del dizionario di stato
+        # 6. State dictionary construction
         return {
             'lfoot': {'pos': left_foot_pose,
                       'vel': l_foot_spatial_velocity,

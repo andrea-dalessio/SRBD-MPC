@@ -58,7 +58,7 @@ class Logger():
             fig.savefig(out_path, dpi=180, bbox_inches='tight')
             saved_files.append(out_path)
         
-        # Estrazione Dati
+        # Data extraction
         com_des = np.array(self.log['desired', 'com', 'pos'])
         if len(com_des) == 0:
             print("Nessun campione disponibile nel logger.")
@@ -87,10 +87,10 @@ class Logger():
         ax.legend(loc='lower left', prop={'size': 7})
         ax.grid(True)
 
-        # 2. Orientamento Base (Quaternioni XYZ)
+        # 2. Base orientation (XYZ quaternion components)
         ax = axs[0, 1]
-        # In SRBD il controllo d'assetto sostituisce lo ZMP del LIP.
-        # Plottiamo le componenti X, Y, Z del quaternione del torso per vedere la stabilità.
+        # In SRBD, attitude control replaces LIP-based ZMP control.
+        # Plot torso quaternion components X, Y, Z to assess stability.
         ax.plot(time_steps, quat_cur[:, 1], label='Qx (Roll base)')
         ax.plot(time_steps, quat_cur[:, 2], label='Qy (Pitch base)')
         ax.plot(time_steps, quat_cur[:, 3], label='Qz (Yaw base)')
@@ -99,12 +99,12 @@ class Logger():
         ax.legend(loc='lower left')
         ax.grid(True)
 
-        # 3. Forze Verticali (GRF)
+        # 3. Vertical forces (GRF)
         ax = axs[1, 0]
         if 'forces' in self.log and len(self.log['forces']) > 0:
             forces = np.array(self.log['forces']) # Shape (T, 24)
-            # Ricordiamo che U è [fx,fy,fz] x 4 per Left e x 4 per Right
-            # Fz totale = somma degli indici 2, 5, 8, 11 (Left) e 14, 17, 20, 23 (Right)
+            # Recall that U is [fx, fy, fz] x 4 for left and x 4 for right
+            # Total Fz = sum of indices 2, 5, 8, 11 (left) and 14, 17, 20, 23 (right)
             fz_left = np.sum(forces[:, [2, 5, 8, 11]], axis=1)
             fz_right = np.sum(forces[:, [14, 17, 20, 23]], axis=1)
             fz_tot = fz_left + fz_right
@@ -117,11 +117,11 @@ class Logger():
             ax.set_title('Forze non loggate')
         ax.grid(True)
 
-        # 4. Coppie WBC Inverse Dynamics
+        # 4. WBC inverse dynamics torques
         ax = axs[1, 1]
         if 'commands' in self.log and len(self.log['commands']) > 0:
             commands = np.array(self.log['commands'])
-            # Mostriamo le coppie delle prime 6 giunture loggate (es. anca e caviglia)
+            # Show torques for the first 6 logged joints (e.g., hip and ankle)
             for i in range(min(6, commands.shape[1])):
                 ax.plot(time_steps, commands[:, i], label=f'Joint {i} Tau')
             ax.set_title('Inverse Dynamics Torques (WBC)')
@@ -139,25 +139,25 @@ class Logger():
             fig2, ax2 = plt.subplots(figsize=(8, 10))
             fig2.suptitle('Footstep Replanning (2D Map)', fontsize=16)
 
-            # Plotta i footprint iniziali
+            # Plot initial footprints
             for i, step in enumerate(self.initial_plan):
                 x, y, z = step['pos']
                 color = 'tab:blue' if step['foot_id'] == 'lfoot' else 'tab:green'
                 ax2.plot(x, y, marker='s', markersize=30, color=color, alpha=0.2)
                 ax2.text(x, y, str(i), color=color, fontsize=14, ha='center', va='center', fontweight='bold')
 
-            # Plotta i footprint post impatto
+            # Plot post-impact footprints
             if hasattr(self, 'post_impact_plan') and self.post_impact_plan is not None:
                 for i, step in enumerate(self.post_impact_plan):
                     x, y, z = step['pos']
                     ax2.plot(x, y, marker='s', markersize=30, markeredgecolor='red', markerfacecolor='none', linestyle='--', linewidth=3)
                     ax2.text(x, y+0.04, f"{i}'", color='red', fontsize=14, ha='center', va='center', fontweight='bold')
 
-            # Traiettoria CoM sulla mappa footsteps
+            # CoM trajectory on the footsteps map
             ax2.plot(com_cur[:, 0], com_cur[:, 1], 'k-', linewidth=2.0, label='CoM Current')
             ax2.plot(com_des[:, 0], com_des[:, 1], 'k--', linewidth=1.5, alpha=0.8, label='CoM Desired')
 
-            # Marker disturbi esterni applicati
+            # Markers for applied external disturbances
             if len(self.log['disturbances']) > 0:
                 for event in self.log['disturbances']:
                     p = event['com_xy']

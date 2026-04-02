@@ -83,15 +83,15 @@ class InverseDynamics:
         if not np.all(np.isfinite(np.asarray(optimal_forces))):
             return np.zeros(self.dofs - 6), False, "Non-finite optimal forces in WBC"
 
-        # 1. Identificazione fasi di contatto (booleani numerici)
+        # 1. Contact phase detection (numeric booleans)
         contact_l = 1.0 if (swing_Foot == 'ds' or swing_Foot == 'rfoot') else 0.0
         contact_r = 1.0 if (swing_Foot == 'ds' or swing_Foot == 'lfoot') else 0.0
         lsole = self.robot.getBodyNode('l_sole')
         rsole = self.robot.getBodyNode('r_sole')
         torso = self.robot.getBodyNode('torso')
         base  = self.robot.getBodyNode('body')
-        # 2. Trasformazione Forze MPC (Puntuali) -> Wrench (6D) per la WBC
-        # L'MPC lavora nel World Frame, quindi calcoliamo i momenti nel World Frame
+        # 2. MPC force transformation (point forces) -> 6D wrenches for WBC
+        # MPC runs in the world frame, so moments are computed in the world frame
         d = self.d 
         f0, f1 = optimal_forces[0:3], optimal_forces[3:6]   
         f2, f3 = optimal_forces[6:9], optimal_forces[9:12] 
@@ -139,7 +139,7 @@ class InverseDynamics:
         elif swing_Foot == 'rfoot':
             f_c_ref[6:] *= 0.0
 
-        # 4. TUNING PESI E GUADAGNI (Aggiornati per SRBD)
+        # 4. WEIGHT AND GAIN TUNING (updated for SRBD)
         tasks = ['lfoot', 'rfoot', 'com', 'torso', 'base', 'joints']
 
         weights = {'lfoot': 5., 'rfoot': 5., 'com': 10., 'torso': 4.0, 'base': 2.0, 'joints': 4.5}
@@ -149,7 +149,7 @@ class InverseDynamics:
         
         W_force_track = 1.0
 
-        # 5. Jacobiani e Derivate (Ruotati nel World Frame per i Task)
+        # 5. Jacobians and derivatives (rotated in the world frame for tasks)
         J_task = {
             'lfoot' : R_lsole_6x6 @ self.robot.getJacobian(lsole),
             'rfoot' : R_rsole_6x6 @ self.robot.getJacobian(rsole),
@@ -168,11 +168,11 @@ class InverseDynamics:
             'joints': np.zeros((self.dofs, self.dofs))
         }
 
-        # Jacobiani di Contatto (In Body Frame per A_eq e A_foot)
+        # Contact Jacobians (in body frame for A_eq and A_foot)
         Jc_lfoot = self.robot.getJacobian(lsole)
         Jc_rfoot = self.robot.getJacobian(rsole)
 
-        # 6. Feedforward, Errori di Posizione e Velocità
+        # 6. Feedforward, position errors, and velocity errors
         ff = {
             'lfoot' : desired['lfoot']['acc'].flatten(),
             'rfoot' : desired['rfoot']['acc'].flatten(),
@@ -189,8 +189,8 @@ class InverseDynamics:
             'joints': (desired['joint']['pos'] - current['joint']['pos']).flatten()
         }
 
-        # Correzione specifica per Torso e Base (da Matrice 3x3 a Errore 3D)
-        # Usiamo la funzione logaritmica della rotazione R_des * R_curr^T per ottenere l'asse di rotazione
+        # Specific correction for torso and base (from 3x3 matrix to 3D error)
+        # Use the rotation logarithm of R_des * R_curr^T to obtain the rotation axis
         pos_error['torso'] = rotation_error(desired['torso']['pos'], current['torso']['pos']).flatten()
         pos_error['base']  = rotation_error(desired['base']['pos'], current['base']['pos']).flatten()
 
@@ -203,7 +203,7 @@ class InverseDynamics:
             'joints': (desired['joint']['vel'] - current['joint']['vel']).flatten()
         }
 
-        # 7. Costruzione della Funzione Costo QP
+        # 7. QP cost function construction
         H = np.zeros((self.n_vars, self.n_vars))
         F = np.zeros(self.n_vars)
         q_ddot_indices = np.arange(self.dofs)
@@ -211,7 +211,7 @@ class InverseDynamics:
         f_c_indices = np.arange(2 * self.dofs, self.n_vars)
 
         for task in tasks:
-            # Task obiettivo: J*q_ddot + Jdot*q_dot = acc_des
+            # Task objective: J*q_ddot + Jdot*q_dot = acc_des
             H_task = weights[task] * J_task[task].T @ J_task[task]
             acc_des = ff[task] + vel_gains[task] * vel_error[task] + pos_gains[task] * pos_error[task]
             F_task = - weights[task] * J_task[task].T @ (acc_des - Jdot_task[task] @ current['joint']['vel'])
@@ -219,38 +219,38 @@ class InverseDynamics:
             H[np.ix_(q_ddot_indices, q_ddot_indices)] += H_task
             F[q_ddot_indices] += F_task
 
-        # Forza l'inseguimento delle forze MPC e regolarizza Tau
+        # Enforce MPC force tracking and regularize tau
         H[np.ix_(f_c_indices, f_c_indices)] += np.eye(len(f_c_indices)) * W_force_track
         F[f_c_indices] += - W_force_track * f_c_ref
         
-        W_tau = 1e-4 # Penalità su Tau per non farlo sbracciare!
+        W_tau = 1e-4 # Penalty on tau to avoid excessive actuation
         H[np.ix_(tau_indices, tau_indices)] += np.eye(self.dofs) * W_tau
 
-        # 8. Vincoli di Dinamica: M * q_ddot + C + G = tau + Jc^T * fc
+        # 8. Dynamics constraints: M * q_ddot + C + G = tau + Jc^T * fc
         inertia_matrix = self.robot.getMassMatrix()
         actuation_matrix = block_diag(np.zeros((6, 6)), np.eye(self.dofs - 6))
         
-        # Jacobiano di contatto nel BODY FRAME
+        # Contact Jacobian in the body frame
         Jc = np.vstack((contact_l * Jc_lfoot, contact_r * Jc_rfoot))
         
         A_eq = np.hstack((inertia_matrix, - actuation_matrix, - Jc.T))
         b_eq = - self.robot.getCoriolisAndGravityForces()
 
-        # 9. Vincoli di Ineguaglianza (Cono attrito e COP)
+        # 9. Inequality constraints (friction cone and COP)
         A_ineq = np.zeros((self.n_ineq_constraints, self.n_vars))
         b_ineq = np.zeros(self.n_ineq_constraints)
         
-        # Matrice per il cono di attrito e stabilità per un singolo piede
+        # Matrix for friction-cone and stability constraints for one foot
         A_foot = np.array([
             [ 1, 0, 0, 0, 0, -self.d], [ -1, 0, 0, 0, 0, -self.d], # COP X
             [ 0, 1, 0, 0, 0, -self.d], [  0, -1, 0, 0, 0, -self.d], # COP Y
-            [ 0, 0, 0, 1, 0, -self.µ], [  0, 0, 0, -1, 0, -self.µ], # Attrito X
-            [ 0, 0, 0, 0, 1, -self.µ], [  0, 0, 0, 0, -1, -self.µ], # Attrito Y
+            [ 0, 0, 0, 1, 0, -self.µ], [  0, 0, 0, -1, 0, -self.µ], # Friction X
+            [ 0, 0, 0, 0, 1, -self.µ], [  0, 0, 0, 0, -1, -self.µ], # Friction Y
             [ 0, 0, 0, 0, 0, -1.0]                                  # f_z >= 0 -> -f_z <= 0
         ])
         A_ineq[:self.n_contact_ineq_constraints, f_c_indices] = block_diag(A_foot, A_foot)
 
-        # 9b. Vincoli hard di postura: limiti su q_{k+1} per testa e braccia
+        # 9b. Hard posture constraints: limits on q_{k+1} for neck and arms
         # q_{k+1} = q + dt*q_dot + 0.5*dt^2*q_ddot
         if self.n_joint_ineq_constraints > 0:
             dt = self.control_dt
@@ -271,7 +271,7 @@ class InverseDynamics:
                 A_ineq[row_low, dof_idx] = -1.0
                 b_ineq[row_low] = -qdd_min
 
-        # 10. Risoluzione QP e Saturazione
+        # 10. QP solve and torque saturation
         if not (
             np.all(np.isfinite(H)) and
             np.all(np.isfinite(F)) and
