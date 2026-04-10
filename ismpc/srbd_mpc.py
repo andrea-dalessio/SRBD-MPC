@@ -1,5 +1,6 @@
 import numpy as np
 import casadi as cs
+import os
 
 class SrbdMpc:
     def __init__ (self, initial, footstep_planner, params):
@@ -16,6 +17,7 @@ class SrbdMpc:
         self.I_body_inv = np.linalg.inv(self.I)
         self.mu = params['µ']
         self.g = [0, 0, -params['g']]
+        self.debug_verbose = os.environ.get('MPC_DEBUG_VERBOSE', '0').strip().lower() in ['1', 'true', 'yes']
         
         # Definizione della dinamica f con rotazione dell'inerzia
         self.f = lambda x, u, p_contacts: self._get_dynamics_with_rot_inertia(x, u, p_contacts)
@@ -375,11 +377,13 @@ class SrbdMpc:
             
             optimal_controls = self.last_U[:, 0]
             target_state = self.extract_target_state(sol)
-            print(f"--- STEP {t} --- [V] IPOPT | Iters: {self.opt.stats()['iter_count']}")
+            if self.debug_verbose:
+                print(f"--- STEP {t} --- [V] IPOPT | Iters: {self.opt.stats()['iter_count']}")
         except Exception as e:
             self.last_solve_success = False
             self.last_solve_message = str(e)
-            print(f"--- STEP {t} --- [X] IPOPT FALLITO!")
+            if self.debug_verbose:
+                print(f"--- STEP {t} --- [X] IPOPT FALLITO!")
             try:
                 self.opt.debug.show_infeasibilities()
             except Exception:
@@ -388,7 +392,8 @@ class SrbdMpc:
             optimal_controls, target_state = self._build_safe_fallback(current_state, next_step_target)
         
         fz_tot = sum(optimal_controls[i*3 + 2] for i in range(8))
-        print(f"Forza Z Totale: {fz_tot:.1f} N | Coppia Max: {np.max(np.abs(optimal_controls)):.1f}")
+        if self.debug_verbose:
+            print(f"Forza Z Totale: {fz_tot:.1f} N | Coppia Max: {np.max(np.abs(optimal_controls)):.1f}")
 
         phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
         if phase_now == 'ds':
