@@ -17,7 +17,7 @@ class SrbdMpc:
         self.mu = params['µ']
         self.g = [0, 0, -params['g']]
         
-        # Dynamics function with rotational inertia
+        # Definizione della dinamica f con rotazione dell'inerzia
         self.f = lambda x, u, p_contacts: self._get_dynamics_with_rot_inertia(x, u, p_contacts)
         self.last_X = None
         self.last_U = None
@@ -73,7 +73,7 @@ class SrbdMpc:
 
         I_world_inv = R @ self.I_body_inv @ R.T
         
-        # Get current inertia in world frame and compute angular momentum
+        # Ci serve comunque I_world per il momento angolare L
         I_world = R @ self.I @ R.T
         L = I_world @ omega
 
@@ -130,18 +130,22 @@ class SrbdMpc:
         
         L_max = 0.5 # maximum leg length
 
-        # Radial limit for the swing foot around the support foot
+        # Limite radiale semplice
         self.opt.subject_to( 
             (self.p_swing[0] - support_foot_pos[0])**2 + 
             (self.p_swing[1] - support_foot_pos[1])**2 <= L_max**2 
         )
         
-        # NO LEGS CROSSING CONSTRAINT. The constraint is applied with the right orientation based on what support
-        # foot has been used.
-        min_clearance = 0.10  # 10 cm between the feet to avoid crossing
+        # VINCOLO ANTI-COMPENETRAZIONE (No Crossed Legs)
+        # La gamba sinistra (Y positivo) deve restare a sinistra della destra (Y negativo)
+        min_clearance = 0.10  # Minimo 10 cm tra i piedi
         if support_id == 'lfoot':
+            # Piede d'appoggio è il sinistro, quindi p_swing è il destro.
+            # Il destro deve restare a DESTRA del sinistro (y_destro < y_sinistro - clearance)
             self.opt.subject_to(self.p_swing[1] <= support_foot_pos[1] - min_clearance)
         else:
+            # Piede d'appoggio è il destro, quindi p_swing è il sinistro.
+            # Il sinistro deve restare a SINISTRA del destro (y_sinistro > y_destro + clearance)
             self.opt.subject_to(self.p_swing[1] >= support_foot_pos[1] + min_clearance)
         
     def compute_controls(self, current_state, t, nominal_plan=None):
@@ -172,15 +176,15 @@ class SrbdMpc:
                 contact = self.footstep_planner.plan[step_idx]['foot_id']
             return optimal_controls, target_state, contact, self.last_p_swing
 
-        #  Setup optimizer and solve MPC problem
+        #  Inizializzazione Problema di Ottimizzazione
         self.opt = cs.Opti()
         self.X = self.opt.variable(13, self.N + 1) 
         self.U = self.opt.variable(24, self.N)     
         self.p_swing = self.opt.variable(2)
 
-        # STARTUP WITH WARM START 
+        # INIZIALIZZAZIONE E WARM START 
         if getattr(self, 'last_X', None) is not None:
-            # Shift buffer by 5 ticks (WBC 100Hz / MPC 20Hz)
+            # Shift buffer di 5 ticks (frequenza simulatore 100Hz / MPC 20Hz)
             shift = 5
             if self.N > shift:
                 X_guess = np.hstack((self.last_X[:, shift:], np.tile(self.last_X[:, -1:], (1, shift))))
@@ -219,7 +223,7 @@ class SrbdMpc:
         
         current_support = self.footstep_planner.plan[current_step_index]['foot_id']
         
-        #  Task weights
+        #  TUNING PESI 
         cost = 0.0
         W_com_z = 5000
         W_com_xy = 100
@@ -246,10 +250,11 @@ class SrbdMpc:
             else:
                 plan_to_use = self.footstep_planner.plan
 
-            # Find the last step in the horizon where LFOOT is the swing foot
+            # Trova l'ultimo step in cui LFOOT era il piede di swing
             last_swing_l = -1
             for j in range(current_step_index, future_step_index + 1):
                 j_valid = min(j, len(plan_to_use)-1)
+                # se il supporto è rfoot, LFOOT è lo swing
                 if plan_to_use[j_valid]['foot_id'] == 'rfoot': 
                     last_swing_l = j_valid
             
@@ -263,7 +268,7 @@ class SrbdMpc:
                 p_lfoot_k = plan_to_use[last_swing_l]['pos'][0:2]
                 yaw_l_k   = plan_to_use[last_swing_l]['ang'][2]
 
-            # Find the last step in the horizon where RFOOT is the swing foot
+            # Trova l'ultimo step in cui RFOOT era il piede di swing
             last_swing_r = -1
             for j in range(current_step_index, future_step_index + 1):
                 j_valid = min(j, len(plan_to_use)-1)
@@ -284,11 +289,11 @@ class SrbdMpc:
 
             p_contacts = self.generate_contact_points(p_lfoot_k, p_rfoot_k, yaw_l_k, yaw_r_k, 0.0)
 
-            # State and control at time k 
+            # DINAMICA E VINCOLI FISICI 
             x_k = self.X[:, k]
             u_k = self.U[:, k]
             
-            # Euler integration of dynamics 
+            # Integrazione dinamica 
             x_next = x_k + self.delta * self.f(x_k, u_k, p_contacts)
             self.opt.subject_to(self.X[:, k + 1] == x_next)
             
@@ -299,7 +304,7 @@ class SrbdMpc:
                 fy = self.U[i*3 + 1, k]
                 fz = self.U[i*3 + 2, k]
                 
-                # Contact force constraints with friction cone
+                # Forza Z minima a 0.1 per stabilità numerica
                 self.opt.subject_to(self.opt.bounded(0.0, fz, 500.0)) 
                 self.opt.subject_to(self.opt.bounded(-self.mu * fz, fx, self.mu * fz))
                 self.opt.subject_to(self.opt.bounded(-self.mu * fz, fy, self.mu * fz))
@@ -316,31 +321,31 @@ class SrbdMpc:
 
             
             # Cost function
-            # (1) Height tracking of the CoM
+            # Altezza CoM
             cost += W_com_z * (self.X[2, k + 1] - h_ref)**2
             
-            # (2) XY tracking of the CoM
+            # Target XY del CoM (Spostamento del peso)
             if phase == 'ds':
                 com_xy_target = (p_lfoot_k + p_rfoot_k) / 2.0
             else:
                 if swing_foot_k == 'lfoot':
-                    # Right support: Move CoM 2cm forward from the right foot, ZERO lateral
+                    # Supporto DESTRO: spostiamo solo 2cm in avanti, ZERO lateralmente
                     com_xy_target = p_rfoot_k + np.array([0.02, 0.0]) 
                 else:
-                    # Left support: Move CoM 2cm forward from the left foot, ZERO lateral
+                    # Supporto SINISTRO: spostiamo solo 2cm in avanti, ZERO lateralmente
                     com_xy_target = p_lfoot_k + np.array([0.02, 0.0])
             
             cost += W_com_xy * cs.sumsqr(self.X[0:2, k+1] - com_xy_target)
             
-            # (3) Regularization (Velocity, Orientation, Omega)
+            # Regolarizzazioni (Velocità, Orientamento, Omega)
             cost += cs.mtimes([(self.X[3:6, k+1]).T, W_vel, self.X[3:6, k+1]])
             
-            # (4) Tracking of the dynamic yaw orientation along the trajectory
+            # Tracking dell'orientamento Yaw dinamico lungo la traiettoria
             yaw_ref = (yaw_l_k + yaw_r_k) / 2.0
             q_ref_w = cs.cos(yaw_ref / 2.0)
             q_ref_z = cs.sin(yaw_ref / 2.0)
             
-            # (5) Independent penalties: Roll and Pitch (fixed), Yaw (follows the footsteps)
+            # Penalizzazioni indipendenti: Roll e Pitch (fermi), Yaw (segue le orme)
             cost += W_quat[0,0] * self.X[7, k+1]**2
             cost += W_quat[1,1] * self.X[8, k+1]**2
             q_dot_err = self.X[6, k+1]*q_ref_w + self.X[9, k+1]*q_ref_z
@@ -350,10 +355,10 @@ class SrbdMpc:
             cost += W_quat_norm * (cs.sumsqr(self.X[6:10, k+1]) - 1.0)**2
             cost += cs.mtimes([u_k.T, W_force, u_k])
                 
-        # Kinematic constraints
+        # Vincoli cinematici gamba
         self.apply_kinematic_constraints(planner_tick)
         
-        # Target for the foot that will land (p_swing)
+        # Target per il piede che atterrerà (p_swing)
         cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
         
         self.opt.minimize(cost)
@@ -363,7 +368,7 @@ class SrbdMpc:
             self.last_solve_success = True
             self.last_solve_message = ""
             
-            # Keep last state and control for warm starting and fallback
+            # Salvare per Warm Start e Buffering
             self.last_X = sol.value(self.X)
             self.last_U = sol.value(self.U)
             self.last_p_swing = sol.value(self.p_swing)

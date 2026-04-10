@@ -1,5 +1,6 @@
 import dartpy as dart
 import numpy as np
+import os
 from utils import *
 
 class InverseDynamics:
@@ -11,13 +12,22 @@ class InverseDynamics:
         µ=0.5,
         control_dt=0.01,
         protected_joint_deviation_deg=None,
-        enable_protected_joint_constraints=False
+        enable_protected_joint_constraints=False,
+        use_model_torque_limits=True,
+        enable_knee_safety=True,
+        knee_min_support_deg=12.0,
+        knee_min_ds_deg=8.0,
+        profile_name='wbc'
     ):
         self.robot = robot
         self.dofs = self.robot.getNumDofs()
         self.d = foot_size / 2.
         self.µ = µ
         self.control_dt = control_dt
+        self.profile_name = profile_name
+        self.use_model_torque_limits = bool(use_model_torque_limits)
+        self.enable_knee_safety = bool(enable_knee_safety)
+        self.debug_verbose = os.environ.get('WBC_DEBUG_VERBOSE', '0').strip().lower() in ['1', 'true', 'yes']
 
         if protected_joint_deviation_deg is None:
             protected_joint_deviation_deg = {
@@ -51,6 +61,29 @@ class InverseDynamics:
                 if q_min < q_max:
                     self.protected_joint_constraints.append((dof_idx, q_min, q_max, joint_name))
 
+        self.q_lower_limits = np.asarray(self.robot.getPositionLowerLimits(), dtype=float)
+        self.knee_dof_indices = {}
+        for knee_name in ['L_KNEE_P', 'R_KNEE_P']:
+            try:
+                self.knee_dof_indices[knee_name] = self.robot.getDof(knee_name).getIndexInSkeleton()
+            except Exception:
+                continue
+
+        if len(self.knee_dof_indices) < 2:
+            self.enable_knee_safety = False
+
+        self.knee_min_support = {}
+        self.knee_min_ds = {}
+        self.knee_min_swing = {}
+        if self.enable_knee_safety:
+            support_target = np.deg2rad(knee_min_support_deg)
+            ds_target = np.deg2rad(knee_min_ds_deg)
+            for knee_name, dof_idx in self.knee_dof_indices.items():
+                knee_lower = float(self.q_lower_limits[dof_idx])
+                self.knee_min_support[knee_name] = max(knee_lower + np.deg2rad(1.5), support_target)
+                self.knee_min_ds[knee_name] = max(knee_lower + np.deg2rad(1.0), ds_target)
+                self.knee_min_swing[knee_name] = knee_lower + np.deg2rad(0.5)
+
         # define sizes for QP solver
         self.num_contacts = 2
         self.num_contact_dims = self.num_contacts * 6
@@ -58,7 +91,8 @@ class InverseDynamics:
 
         self.n_eq_constraints = self.dofs
         self.n_contact_ineq_constraints = 9 * self.num_contacts
-        self.n_joint_ineq_constraints = 2 * len(self.protected_joint_constraints)
+        self.n_knee_ineq_constraints = len(self.knee_dof_indices) if self.enable_knee_safety else 0
+        self.n_joint_ineq_constraints = 2 * len(self.protected_joint_constraints) + self.n_knee_ineq_constraints
         self.n_ineq_constraints = self.n_contact_ineq_constraints + self.n_joint_ineq_constraints
 
         # initialize QP solver
@@ -71,13 +105,98 @@ class InverseDynamics:
             if joint_name in redundant_dofs:
                 self.joint_selection[i, i] = 1
 
+        if self.use_model_torque_limits:
+            # Use model-provided torque limits for actuated joints (exclude floating base).
+            tau_lower_all = np.asarray(self.robot.getForceLowerLimits(), dtype=float)
+            tau_upper_all = np.asarray(self.robot.getForceUpperLimits(), dtype=float)
+            self.tau_lower_limits = tau_lower_all[6:].copy()
+            self.tau_upper_limits = tau_upper_all[6:].copy()
+
+            invalid = (
+                ~np.isfinite(self.tau_lower_limits) |
+                ~np.isfinite(self.tau_upper_limits) |
+                ((self.tau_upper_limits - self.tau_lower_limits) < 1e-3)
+            )
+            self.tau_lower_limits[invalid] = -100.0
+            self.tau_upper_limits[invalid] = 100.0
+        else:
+            self.tau_lower_limits = -100.0 * np.ones(self.dofs - 6)
+            self.tau_upper_limits = 100.0 * np.ones(self.dofs - 6)
+
     def _is_finite_structure(self, obj):
         if isinstance(obj, dict):
             return all(self._is_finite_structure(v) for v in obj.values())
         arr = np.asarray(obj)
         return np.all(np.isfinite(arr))
 
-    def get_joint_torques(self, desired, current, swing_Foot, optimal_forces):
+    def _knee_min_target(self, knee_name, swing_Foot):
+        if not self.enable_knee_safety:
+            return None
+
+        if swing_Foot == 'ds':
+            return self.knee_min_ds[knee_name]
+
+        support_knee = None
+        if swing_Foot == 'lfoot':
+            support_knee = 'R_KNEE_P'
+        elif swing_Foot == 'rfoot':
+            support_knee = 'L_KNEE_P'
+
+        if knee_name == support_knee:
+            return self.knee_min_support[knee_name]
+        return self.knee_min_swing[knee_name]
+
+    def _build_failure_diag(
+        self,
+        current,
+        swing_Foot,
+        recovery_mode,
+        H,
+        b_eq,
+        b_ineq,
+        optimal_forces,
+        f_c_ref,
+        contact_l,
+        contact_r
+    ):
+        try:
+            H_reg = H + 1e-8 * np.eye(H.shape[0])
+            H_cond = np.linalg.cond(H_reg)
+        except Exception:
+            H_cond = np.nan
+
+        knee_terms = []
+        for knee_name in ['L_KNEE_P', 'R_KNEE_P']:
+            if knee_name in self.knee_dof_indices:
+                idx = self.knee_dof_indices[knee_name]
+                knee_deg = np.rad2deg(current['joint']['pos'][idx])
+                knee_terms.append(f"{knee_name}:{knee_deg:.1f}")
+        knee_str = ','.join(knee_terms) if knee_terms else 'n/a'
+
+        chest_terms = []
+        for chest_name in ['CHEST_Y', 'CHEST_P']:
+            try:
+                idx = self.robot.getDof(chest_name).getIndexInSkeleton()
+                chest_terms.append(f"{chest_name}:{np.rad2deg(current['joint']['pos'][idx]):.1f}")
+            except Exception:
+                continue
+        chest_str = ','.join(chest_terms) if chest_terms else 'n/a'
+
+        fz_l = float(f_c_ref[5]) if len(f_c_ref) >= 6 else np.nan
+        fz_r = float(f_c_ref[11]) if len(f_c_ref) >= 12 else np.nan
+
+        return (
+            f"diag[profile={self.profile_name},recovery={int(bool(recovery_mode))},"
+            f"swing={swing_Foot},contact=({int(contact_l)},{int(contact_r)}),"
+            f"knee_deg=({knee_str}),chest_deg=({chest_str}),"
+            f"fz_ref=({fz_l:.1f},{fz_r:.1f}),"
+            f"|f_mpc|={np.linalg.norm(optimal_forces):.1f},"
+            f"cond(H)={H_cond:.2e},|b_eq|={np.linalg.norm(b_eq):.2e},"
+            f"b_ineq[min,max]=({np.min(b_ineq):.2e},{np.max(b_ineq):.2e}),"
+            f"tau_clip={'model' if self.use_model_torque_limits else 'legacy100'}]"
+        )
+
+    def get_joint_torques(self, desired, current, swing_Foot, optimal_forces, recovery_mode=False):
         if not self._is_finite_structure(desired) or not self._is_finite_structure(current):
             return np.zeros(self.dofs - 6), False, "Non-finite desired/current state in WBC"
         if not np.all(np.isfinite(np.asarray(optimal_forces))):
@@ -146,6 +265,20 @@ class InverseDynamics:
 
         pos_gains = {'lfoot': 500., 'rfoot': 500., 'com': 100., 'torso': 80., 'base': 50., 'joints': 90.0}
         vel_gains = {'lfoot': 60., 'rfoot': 60., 'com': 20., 'torso': 20., 'base': 10., 'joints': 14.0}
+
+        if recovery_mode:
+            # Reduce upper-body aggressiveness during the post-impact transient.
+            weights['torso'] = 1.8
+            weights['base'] = 0.8
+            weights['joints'] = 2.8
+
+            pos_gains['torso'] = 45.0
+            pos_gains['base'] = 20.0
+            pos_gains['joints'] = 70.0
+
+            vel_gains['torso'] = 12.0
+            vel_gains['base'] = 6.0
+            vel_gains['joints'] = 10.0
         
         W_force_track = 1.0
 
@@ -271,6 +404,22 @@ class InverseDynamics:
                 A_ineq[row_low, dof_idx] = -1.0
                 b_ineq[row_low] = -qdd_min
 
+            # 9c. Knee anti-hyperextension safety for the support leg(s).
+            if self.n_knee_ineq_constraints > 0:
+                knee_row_start = start_row + 2 * len(self.protected_joint_constraints)
+                for j, knee_name in enumerate(['L_KNEE_P', 'R_KNEE_P']):
+                    if knee_name not in self.knee_dof_indices:
+                        continue
+                    dof_idx = self.knee_dof_indices[knee_name]
+                    q_now = current['joint']['pos'][dof_idx]
+                    qd_now = current['joint']['vel'][dof_idx]
+                    q_min_target = self._knee_min_target(knee_name, swing_Foot)
+
+                    qdd_min = 2.0 * (q_min_target - q_now - dt * qd_now) / (dt * dt)
+                    row = knee_row_start + j
+                    A_ineq[row, dof_idx] = -1.0
+                    b_ineq[row] = -qdd_min
+
         # 10. QP solve and torque saturation
         if not (
             np.all(np.isfinite(H)) and
@@ -280,20 +429,45 @@ class InverseDynamics:
             np.all(np.isfinite(A_ineq)) and
             np.all(np.isfinite(b_ineq))
         ):
-            return np.zeros(self.dofs - 6), False, "Non-finite QP matrices in WBC"
+            diag = self._build_failure_diag(
+                current,
+                swing_Foot,
+                recovery_mode,
+                H,
+                b_eq,
+                b_ineq,
+                optimal_forces,
+                f_c_ref,
+                contact_l,
+                contact_r
+            )
+            return np.zeros(self.dofs - 6), False, f"Non-finite QP matrices in WBC | {diag}"
 
         self.qp_solver.set_values(H, F, A_eq, b_eq, A_ineq, b_ineq)
         solution = self.qp_solver.solve()
         if solution is None or not np.all(np.isfinite(solution)):
             print("WBC QP Solver fallito! Restituisco coppie nulle per sicurezza.")
-            return np.zeros(self.dofs - 6), False, "WBC QP solver failed"
+            diag = self._build_failure_diag(
+                current,
+                swing_Foot,
+                recovery_mode,
+                H,
+                b_eq,
+                b_ineq,
+                optimal_forces,
+                f_c_ref,
+                contact_l,
+                contact_r
+            )
+            return np.zeros(self.dofs - 6), False, f"WBC QP solver failed | {diag}"
 
-        print("solution fc:", solution[f_c_indices])
-        print("solution tau max:", np.max(np.abs(solution[tau_indices])))
-        print("==============================")
+        if self.debug_verbose:
+            print("solution fc:", solution[f_c_indices])
+            print("solution tau max:", np.max(np.abs(solution[tau_indices])))
+            print("==============================")
 
         tau = solution[tau_indices]
         joint_torques = tau[6:] 
         
        
-        return np.clip(joint_torques, -100.0, 100.0), True, ""
+        return np.clip(joint_torques, self.tau_lower_limits, self.tau_upper_limits), True, ""

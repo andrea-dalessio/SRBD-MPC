@@ -17,6 +17,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.world = world
         self.hrp4 = hrp4
         self.time = 0
+        self.debug_verbose = os.environ.get('SIM_DEBUG_VERBOSE', '0').strip().lower() in ['1', 'true', 'yes']
         self.params = {
             'g': 9.81,
             'foot_size': 0.1,
@@ -97,18 +98,30 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             'NECK_Y': 16.0,
             'NECK_P': 14.0
         }
+
+        use_model_torque_limits = os.environ.get('USE_MODEL_TORQUE_LIMITS', '1').strip().lower() not in ['0', 'false', 'no']
+        print(f"[CONFIG] use_model_torque_limits={use_model_torque_limits}")
+
         self.id_strict = id.InverseDynamics(
             self.hrp4,
             redundant_dofs,
             control_dt=self.params['world_time_step'],
             protected_joint_deviation_deg=protected_joint_cfg,
-            enable_protected_joint_constraints=True
+            enable_protected_joint_constraints=True,
+            use_model_torque_limits=use_model_torque_limits,
+            knee_min_support_deg=18.0,
+            knee_min_ds_deg=12.0,
+            profile_name='strict'
         )
         self.id_relaxed = id.InverseDynamics(
             self.hrp4,
             redundant_dofs,
             control_dt=self.params['world_time_step'],
-            enable_protected_joint_constraints=False
+            enable_protected_joint_constraints=False,
+            use_model_torque_limits=use_model_torque_limits,
+            knee_min_support_deg=18.0,
+            knee_min_ds_deg=12.0,
+            profile_name='relaxed'
         )
         
         # Shoulder Indices for Arm Swing
@@ -116,6 +129,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.l_shoulder_p_idx = self.hrp4.getDof('L_SHOULDER_P').getIndexInSkeleton()
         self.chest_y_idx = self.hrp4.getDof('CHEST_Y').getIndexInSkeleton()
         self.chest_p_idx = self.hrp4.getDof('CHEST_P').getIndexInSkeleton()
+        self.l_knee_p_idx = self.hrp4.getDof('L_KNEE_P').getIndexInSkeleton()
+        self.r_knee_p_idx = self.hrp4.getDof('R_KNEE_P').getIndexInSkeleton()
 
         # initialize footstep planner
         reference = [(0.1, 0., 0.2)] * 5 + [(0.1, 0., -0.1)] * 10 + [(0.1, 0., 0.)] * 10
@@ -156,9 +171,10 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             'enabled': True,
             'start': 5.0,
             'end': 5.15,
-            'magnitude': 50.0,
+            'magnitude': 65.0,
             'leftward': True
         }
+        self.wbc_recovery_duration = 1.50
 
         self.run_metrics = {
             'max_tau_nm': 0.0,
@@ -168,6 +184,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             'wbc_relaxed_recovery_total': 0,
             'max_chest_y_deg': 0.0,
             'max_chest_p_deg': 0.0,
+            'min_l_knee_deg': float(np.rad2deg(self.initial['joint']['pos'][self.l_knee_p_idx])),
+            'min_r_knee_deg': float(np.rad2deg(self.initial['joint']['pos'][self.r_knee_p_idx])),
             'com_err_sum_m': 0.0,
             'com_err_samples': 0
         }
@@ -196,6 +214,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         print(f"WBC strict->relaxed recoveries: {self.run_metrics['wbc_relaxed_recovery_total']}")
         print(f"Max |CHEST_Y|: {self.run_metrics['max_chest_y_deg']:.2f} deg")
         print(f"Max |CHEST_P|: {self.run_metrics['max_chest_p_deg']:.2f} deg")
+        print(f"Min L_KNEE_P: {self.run_metrics['min_l_knee_deg']:.2f} deg")
+        print(f"Min R_KNEE_P: {self.run_metrics['min_r_knee_deg']:.2f} deg")
         if np.isfinite(mean_com_err):
             print(f"Mean CoM tracking error: {mean_com_err:.5f} m")
         else:
@@ -254,6 +274,11 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         return forward / np.linalg.norm(forward)
 
+    def _is_recovery_mode_active(self):
+        if not self.disturbance['enabled']:
+            return False
+        return self.disturbance['start'] <= self.time <= (self.disturbance['end'] + self.wbc_recovery_duration)
+
     # The robot receives a lateral push when in "ss" phase, 5 seconds in. Total impulse = 7.5 Ns.
     def _apply_lateral_disturbance(self, planner_tick):
         if not self.disturbance['enabled']:
@@ -302,8 +327,12 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         chest_y_deg = float(np.rad2deg(self.current['joint']['pos'][self.chest_y_idx]))
         chest_p_deg = float(np.rad2deg(self.current['joint']['pos'][self.chest_p_idx]))
+        l_knee_deg = float(np.rad2deg(self.current['joint']['pos'][self.l_knee_p_idx]))
+        r_knee_deg = float(np.rad2deg(self.current['joint']['pos'][self.r_knee_p_idx]))
         self.run_metrics['max_chest_y_deg'] = max(self.run_metrics['max_chest_y_deg'], abs(chest_y_deg))
         self.run_metrics['max_chest_p_deg'] = max(self.run_metrics['max_chest_p_deg'], abs(chest_p_deg))
+        self.run_metrics['min_l_knee_deg'] = min(self.run_metrics['min_l_knee_deg'], l_knee_deg)
+        self.run_metrics['min_r_knee_deg'] = min(self.run_metrics['min_r_knee_deg'], r_knee_deg)
 
         planner_tick = int(round(self.time / self.params['world_time_step']))
 
@@ -320,9 +349,10 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.desired['joint']['pos'][self.l_shoulder_p_idx] = base_shoulder_pitch + arm_offset
 
         self.current['inertia'] = self.base.getInertia().getMoment()
-        print("inertia used by MPC:")
-        print(self.current['inertia'])
-        print("--------------------")
+        if self.debug_verbose:
+            print("inertia used by MPC:")
+            print(self.current['inertia'])
+            print("--------------------")
 
         if self.time > 26.0:
             self._shutdown_with_plots("Simulazione completata (26s)", exit_code=0)
@@ -449,11 +479,13 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.desired['torso']['acc'] = np.zeros(3)
 
         # 6. WBC computations (Inverse Dynamics)
+        recovery_mode = self._is_recovery_mode_active()
         commands, wbc_ok, wbc_msg = self.id_strict.get_joint_torques(
             self.desired,
             self.current,
             swing_foot_id,
-            optimal_forces
+            optimal_forces,
+            recovery_mode=recovery_mode
         )
 
         if not wbc_ok:
@@ -461,7 +493,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 self.desired,
                 self.current,
                 swing_foot_id,
-                optimal_forces
+                optimal_forces,
+                recovery_mode=recovery_mode
             )
             if relaxed_ok:
                 commands = relaxed_commands
@@ -479,9 +512,10 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         # Debug
         max_tau = np.max(np.abs(commands))
         self.run_metrics['max_tau_nm'] = max(self.run_metrics['max_tau_nm'], float(max_tau))
-        print(f"Time: {self.time} | Phase: {phase_now} | Swing Foot: {swing_foot_id}")
-        print(f"Coppia max: {max_tau:.1f} Nm")
-        print("-" * 20)
+        if self.debug_verbose:
+            print(f"Time: {self.time} | Phase: {phase_now} | Swing Foot: {swing_foot_id}")
+            print(f"Coppia max: {max_tau:.1f} Nm")
+            print("-" * 20)
         
         # 7. Apply torques
         for i in range(self.params['dof'] - 6):
