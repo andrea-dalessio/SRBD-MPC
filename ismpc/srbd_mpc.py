@@ -18,6 +18,13 @@ class SrbdMpc:
         self.mu = params['µ']
         self.g = [0, 0, -params['g']]
         self.debug_verbose = os.environ.get('MPC_DEBUG_VERBOSE', '0').strip().lower() in ['1', 'true', 'yes']
+        self.no_replan_tolerance_m = float(os.environ.get('MPC_NO_REPLAN_TOL_M', '0.01'))
+        self.max_step_length_m = float(os.environ.get('MPC_MAX_STEP_LENGTH_M', '0.35'))
+        self.min_lateral_clearance_m = float(os.environ.get('MPC_MIN_LATERAL_CLEARANCE_M', '0.12'))
+        self.fz_sum_min_factor_ds = float(os.environ.get('MPC_FZ_SUM_MIN_FACTOR_DS', '0.70'))
+        self.fz_sum_max_factor_ds = float(os.environ.get('MPC_FZ_SUM_MAX_FACTOR_DS', '1.35'))
+        self.fz_sum_min_factor_ss = float(os.environ.get('MPC_FZ_SUM_MIN_FACTOR_SS', '0.60'))
+        self.fz_sum_max_factor_ss = float(os.environ.get('MPC_FZ_SUM_MAX_FACTOR_SS', '1.50'))
         
         # Definizione della dinamica f con rotazione dell'inerzia
         self.f = lambda x, u, p_contacts: self._get_dynamics_with_rot_inertia(x, u, p_contacts)
@@ -35,10 +42,29 @@ class SrbdMpc:
         ]
         return all(np.all(np.isfinite(np.asarray(arr))) for arr in state_arrays)
 
-    def _build_safe_fallback(self, current_state, next_step_target):
+    def _build_safe_fallback(self, current_state, next_step_target, phase='ds', support_foot='ds'):
         optimal_controls = np.zeros(24)
-        fz_each = (self.mass * abs(self.g[2])) / 8.0
-        for i in range(8):
+        total_weight = self.mass * abs(self.g[2])
+
+        # Contact-aware fallback: distribute only on active contacts to avoid
+        # unrealistic vertical transients when MPC fails during single support.
+        if phase == 'ss' and support_foot in ['lfoot', 'rfoot']:
+            if support_foot == 'lfoot':
+                active_contacts = range(0, 4)
+            else:
+                active_contacts = range(4, 8)
+            fz_each = total_weight / 4.0
+        else:
+            active_contacts = range(0, 8)
+            fz_each = total_weight / 8.0
+
+        # Slightly reduce fallback vertical force when rising quickly,
+        # to prevent jump-like behavior after failure.
+        com_vz = float(current_state['com']['vel'][2])
+        if com_vz > 0.12:
+            fz_each *= 0.9
+
+        for i in active_contacts:
             optimal_controls[i*3 + 2] = fz_each
 
         target_state = {
@@ -60,7 +86,7 @@ class SrbdMpc:
 
         self.last_U = np.zeros((24, self.N))
         for k in range(self.N):
-            for i in range(8):
+            for i in active_contacts:
                 self.last_U[i*3 + 2, k] = fz_each
 
         self.last_p_swing = np.array(next_step_target).copy()
@@ -130,7 +156,7 @@ class SrbdMpc:
         support_foot_pos = self.footstep_planner.plan[current_step_index]['pos']
         support_id = self.footstep_planner.plan[current_step_index]['foot_id']
         
-        L_max = 0.5 # maximum leg length
+        L_max = self.max_step_length_m # maximum leg length
 
         # Limite radiale semplice
         self.opt.subject_to( 
@@ -140,7 +166,7 @@ class SrbdMpc:
         
         # VINCOLO ANTI-COMPENETRAZIONE (No Crossed Legs)
         # La gamba sinistra (Y positivo) deve restare a sinistra della destra (Y negativo)
-        min_clearance = 0.10  # Minimo 10 cm tra i piedi
+        min_clearance = self.min_lateral_clearance_m
         if support_id == 'lfoot':
             # Piede d'appoggio è il sinistro, quindi p_swing è il destro.
             # Il destro deve restare a DESTRA del sinistro (y_destro < y_sinistro - clearance)
@@ -150,7 +176,7 @@ class SrbdMpc:
             # Il sinistro deve restare a SINISTRA del destro (y_sinistro > y_destro + clearance)
             self.opt.subject_to(self.p_swing[1] >= support_foot_pos[1] + min_clearance)
         
-    def compute_controls(self, current_state, t, nominal_plan=None):
+    def compute_controls(self, current_state, t, nominal_plan=None, allow_footstep_replanning=True):
         planner_tick = int(round(t / self.delta))
         current_step_index = self.footstep_planner.get_step_index_at_time(planner_tick)
         if current_step_index is None:
@@ -161,16 +187,33 @@ class SrbdMpc:
         else:
             plan_for_target = self.footstep_planner.plan
 
-        try:
+        support_id_now = self.footstep_planner.plan[current_step_index]['foot_id']
+        swing_id_now = 'lfoot' if support_id_now == 'rfoot' else 'rfoot'
+
+        has_future_step = (current_step_index + 1) < len(plan_for_target)
+
+        if has_future_step:
             next_step_target = plan_for_target[current_step_index + 1]['pos'][0:2]
-        except IndexError:
-            next_step_target = plan_for_target[current_step_index]['pos'][0:2]
+        else:
+            # End-of-plan fallback: keep swing target near the current swing-foot position.
+            # This avoids conflicting constraints when no landing step is available.
+            next_step_target = np.array(current_state[swing_id_now]['pos'][3:5], dtype=float)
 
         if not self._is_finite_state(current_state):
             self.last_solve_success = False
             self.last_solve_message = "MPC skipped due to non-finite current state"
-            optimal_controls, target_state = self._build_safe_fallback(current_state, next_step_target)
             phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
+            if phase_now == 'ss':
+                support_for_fallback = self.footstep_planner.plan[current_step_index]['foot_id']
+            else:
+                support_for_fallback = 'ds'
+
+            optimal_controls, target_state = self._build_safe_fallback(
+                current_state,
+                next_step_target,
+                phase=phase_now,
+                support_foot=support_for_fallback
+            )
             if phase_now == 'ds':
                 contact = 'ds'
             else:
@@ -310,6 +353,20 @@ class SrbdMpc:
                 self.opt.subject_to(self.opt.bounded(0.0, fz, 500.0)) 
                 self.opt.subject_to(self.opt.bounded(-self.mu * fz, fx, self.mu * fz))
                 self.opt.subject_to(self.opt.bounded(-self.mu * fz, fy, self.mu * fz))
+
+            # Limit total vertical force to avoid jump-like transients when MPC is stressed.
+            fz_sum = 0.0
+            for i in range(8):
+                fz_sum += self.U[i*3 + 2, k]
+
+            mg = self.mass * abs(self.g[2])
+            if phase == 'ss':
+                fz_min = self.fz_sum_min_factor_ss * mg
+                fz_max = self.fz_sum_max_factor_ss * mg
+            else:
+                fz_min = self.fz_sum_min_factor_ds * mg
+                fz_max = self.fz_sum_max_factor_ds * mg
+            self.opt.subject_to(self.opt.bounded(fz_min, fz_sum, fz_max))
             
             step_idx_k = self.footstep_planner.get_step_index_at_time(planner_tick_k)
             support_foot_k = self.footstep_planner.plan[step_idx_k]['foot_id']
@@ -359,9 +416,22 @@ class SrbdMpc:
                 
         # Vincoli cinematici gamba
         self.apply_kinematic_constraints(planner_tick)
-        
-        # Target per il piede che atterrerà (p_swing)
-        cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
+
+        lock_to_nominal = (not allow_footstep_replanning) and has_future_step
+
+        if allow_footstep_replanning:
+            # Target per il piede che atterrerà (p_swing)
+            cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
+        elif lock_to_nominal:
+            # Keep MPC and executed foot trajectory aligned in nominal-mode runs,
+            # while preserving feasibility with a tight tolerance around nominal.
+            tol = self.no_replan_tolerance_m
+            self.opt.subject_to(self.opt.bounded(next_step_target[0] - tol, self.p_swing[0], next_step_target[0] + tol))
+            self.opt.subject_to(self.opt.bounded(next_step_target[1] - tol, self.p_swing[1], next_step_target[1] + tol))
+            cost += (10.0 * W_swing) * cs.sumsqr(self.p_swing - next_step_target)
+        else:
+            # No future step available: keep swing target close without hard locking.
+            cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
         
         self.opt.minimize(cost)
         
@@ -389,7 +459,17 @@ class SrbdMpc:
             except Exception:
                 pass
 
-            optimal_controls, target_state = self._build_safe_fallback(current_state, next_step_target)
+            phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
+            if phase_now == 'ss':
+                support_for_fallback = self.footstep_planner.plan[current_step_index]['foot_id']
+            else:
+                support_for_fallback = 'ds'
+            optimal_controls, target_state = self._build_safe_fallback(
+                current_state,
+                next_step_target,
+                phase=phase_now,
+                support_foot=support_for_fallback
+            )
         
         fz_tot = sum(optimal_controls[i*3 + 2] for i in range(8))
         if self.debug_verbose:

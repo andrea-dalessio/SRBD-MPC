@@ -5,6 +5,9 @@ class FootstepPlanner:
     def __init__(self, vref, initial_lfoot, initial_rfoot, params):
         default_ss_duration = params['ss_duration']
         default_ds_duration = params['ds_duration']
+        initial_stationary_steps = int(params.get('initial_stationary_steps', 2))
+        first_step_ds_multiplier = int(params.get('first_step_ds_multiplier', 2))
+        stationary_step_ds_duration = int(params.get('stationary_step_ds_duration', default_ss_duration + default_ds_duration))
 
         unicycle_pos   = (initial_lfoot[3:5] + initial_rfoot[3:5]) / 2.
         unicycle_theta = (initial_lfoot[2]   + initial_rfoot[2]  ) / 2.
@@ -16,17 +19,20 @@ class FootstepPlanner:
             ss_duration = default_ss_duration
             ds_duration = default_ds_duration
 
-            # exception for first step
-            if j == 0:
+            # Keep the first bootstrap steps stationary to avoid early transient drift.
+            if j < initial_stationary_steps:
                 ss_duration = 0
-                ds_duration = (default_ss_duration + default_ds_duration) * 2
+                if j == 0:
+                    ds_duration = (default_ss_duration + default_ds_duration) * first_step_ds_multiplier
+                else:
+                    ds_duration = stationary_step_ds_duration
 
             # exception for last step
             # to be added
 
             # move virtual unicycle
             for i in range(ss_duration + ds_duration):
-                if j > 1:
+                if j >= initial_stationary_steps:
                     unicycle_theta += vref[j][2] * params['world_time_step']
                     R = np.array([[np.cos(unicycle_theta), - np.sin(unicycle_theta)],
                                   [np.sin(unicycle_theta),   np.cos(unicycle_theta)]])

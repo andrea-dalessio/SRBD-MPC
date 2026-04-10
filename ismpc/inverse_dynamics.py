@@ -21,6 +21,8 @@ class InverseDynamics:
         knee_output_guard_kp=120.0,
         knee_output_guard_kd=8.0,
         knee_output_guard_max_torque=45.0,
+        ankle_pitch_torque_scale=1.0,
+        ankle_roll_torque_scale=1.0,
         profile_name='wbc'
     ):
         self.robot = robot
@@ -36,6 +38,8 @@ class InverseDynamics:
         self.knee_output_guard_kp = float(knee_output_guard_kp)
         self.knee_output_guard_kd = float(knee_output_guard_kd)
         self.knee_output_guard_max_torque = float(knee_output_guard_max_torque)
+        self.ankle_pitch_torque_scale = float(ankle_pitch_torque_scale)
+        self.ankle_roll_torque_scale = float(ankle_roll_torque_scale)
 
         if protected_joint_deviation_deg is None:
             protected_joint_deviation_deg = {
@@ -130,6 +134,38 @@ class InverseDynamics:
         else:
             self.tau_lower_limits = -100.0 * np.ones(self.dofs - 6)
             self.tau_upper_limits = 100.0 * np.ones(self.dofs - 6)
+
+        self._apply_ankle_torque_scaling()
+
+    def _scale_joint_torque_limit(self, joint_name, scale):
+        if scale <= 0.0:
+            return
+        try:
+            dof_idx = self.robot.getDof(joint_name).getIndexInSkeleton()
+        except Exception:
+            return
+
+        act_idx = dof_idx - 6
+        if act_idx < 0 or act_idx >= len(self.tau_lower_limits):
+            return
+
+        lo = float(self.tau_lower_limits[act_idx])
+        hi = float(self.tau_upper_limits[act_idx])
+        center = 0.5 * (lo + hi)
+        half = 0.5 * (hi - lo)
+        half_scaled = max(1e-3, half * scale)
+
+        self.tau_lower_limits[act_idx] = center - half_scaled
+        self.tau_upper_limits[act_idx] = center + half_scaled
+
+    def _apply_ankle_torque_scaling(self):
+        if abs(self.ankle_pitch_torque_scale - 1.0) > 1e-9:
+            for joint_name in ['L_ANKLE_P', 'R_ANKLE_P']:
+                self._scale_joint_torque_limit(joint_name, self.ankle_pitch_torque_scale)
+
+        if abs(self.ankle_roll_torque_scale - 1.0) > 1e-9:
+            for joint_name in ['L_ANKLE_R', 'R_ANKLE_R']:
+                self._scale_joint_torque_limit(joint_name, self.ankle_roll_torque_scale)
 
     def _is_finite_structure(self, obj):
         if isinstance(obj, dict):
