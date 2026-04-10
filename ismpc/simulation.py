@@ -119,8 +119,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             control_dt=self.params['world_time_step'],
             enable_protected_joint_constraints=False,
             use_model_torque_limits=use_model_torque_limits,
-            knee_min_support_deg=18.0,
-            knee_min_ds_deg=12.0,
+            knee_min_support_deg=24.0,
+            knee_min_ds_deg=16.0,
             profile_name='relaxed'
         )
         

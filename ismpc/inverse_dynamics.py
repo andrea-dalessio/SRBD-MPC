@@ -17,6 +17,10 @@ class InverseDynamics:
         enable_knee_safety=True,
         knee_min_support_deg=12.0,
         knee_min_ds_deg=8.0,
+        knee_output_guard_margin_deg=4.0,
+        knee_output_guard_kp=120.0,
+        knee_output_guard_kd=8.0,
+        knee_output_guard_max_torque=45.0,
         profile_name='wbc'
     ):
         self.robot = robot
@@ -28,6 +32,10 @@ class InverseDynamics:
         self.use_model_torque_limits = bool(use_model_torque_limits)
         self.enable_knee_safety = bool(enable_knee_safety)
         self.debug_verbose = os.environ.get('WBC_DEBUG_VERBOSE', '0').strip().lower() in ['1', 'true', 'yes']
+        self.knee_output_guard_margin = np.deg2rad(knee_output_guard_margin_deg)
+        self.knee_output_guard_kp = float(knee_output_guard_kp)
+        self.knee_output_guard_kd = float(knee_output_guard_kd)
+        self.knee_output_guard_max_torque = float(knee_output_guard_max_torque)
 
         if protected_joint_deviation_deg is None:
             protected_joint_deviation_deg = {
@@ -468,6 +476,30 @@ class InverseDynamics:
 
         tau = solution[tau_indices]
         joint_torques = tau[6:] 
+
+        if self.enable_knee_safety:
+            for knee_name in ['L_KNEE_P', 'R_KNEE_P']:
+                if knee_name not in self.knee_dof_indices:
+                    continue
+
+                dof_idx = self.knee_dof_indices[knee_name]
+                joint_idx = dof_idx - 6
+                if joint_idx < 0 or joint_idx >= len(joint_torques):
+                    continue
+
+                q_now = current['joint']['pos'][dof_idx]
+                qd_now = current['joint']['vel'][dof_idx]
+                q_pred = q_now + self.control_dt * qd_now
+
+                q_min_target = self._knee_min_target(knee_name, swing_Foot)
+                q_guard = q_min_target + self.knee_output_guard_margin
+
+                if q_pred < q_guard or qd_now < -0.05:
+                    err = max(0.0, q_guard - q_pred)
+                    corrective = self.knee_output_guard_kp * err + self.knee_output_guard_kd * max(0.0, -qd_now)
+                    corrective = min(corrective, self.knee_output_guard_max_torque)
+                    # Safety net: do not allow extension torques to dominate when knee is near hyperextension.
+                    joint_torques[joint_idx] = max(joint_torques[joint_idx], corrective)
         
        
         return np.clip(joint_torques, self.tau_lower_limits, self.tau_upper_limits), True, ""
