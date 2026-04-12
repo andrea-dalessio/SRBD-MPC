@@ -180,9 +180,9 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.max_consecutive_mpc_failures = 8
         self.mpc_fail_count = 0
         disturbance_enabled = os.environ.get('DISTURBANCE_ENABLED', '1').strip().lower() not in ['0', 'false', 'no']
-        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.0'))
-        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '5.15'))
-        disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '40.0'))
+        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '4.80'))
+        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '4.95'))
+        disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '25.0'))
         disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '1').strip().lower() not in ['0', 'false', 'no']
         self.disturbance = {
             'enabled': disturbance_enabled,
@@ -194,16 +194,16 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.enable_footstep_replanning = os.environ.get('ENABLE_FOOTSTEP_REPLANNING', '1').strip().lower() not in ['0', 'false', 'no']
         self.replan_only_after_disturbance = os.environ.get('REPLAN_ONLY_AFTER_DISTURBANCE', '1').strip().lower() not in ['0', 'false', 'no']
         self.replan_min_shift_m = float(os.environ.get('REPLAN_MIN_SHIFT_M', '0.005'))
-        self.replan_blend_alpha = float(os.environ.get('REPLAN_BLEND_ALPHA', '0.55'))
-        self.replan_max_delta_x_m = float(os.environ.get('REPLAN_MAX_DELTA_X_M', '0.08'))
-        self.replan_max_delta_y_m = float(os.environ.get('REPLAN_MAX_DELTA_Y_M', '0.06'))
+        self.replan_blend_alpha = float(os.environ.get('REPLAN_BLEND_ALPHA', '1.0'))
+        self.replan_max_delta_x_m = float(os.environ.get('REPLAN_MAX_DELTA_X_M', '0.25'))
+        self.replan_max_delta_y_m = float(os.environ.get('REPLAN_MAX_DELTA_Y_M', '0.25'))
         self.replan_max_step_radius_m = float(os.environ.get('REPLAN_MAX_STEP_RADIUS_M', '0.34'))
         self.replan_min_lateral_clearance_m = float(os.environ.get('REPLAN_MIN_LATERAL_CLEARANCE_M', '0.12'))
-        self.replan_max_propagation_shift_m = float(os.environ.get('REPLAN_MAX_PROPAGATION_SHIFT_M', '0.08'))
+        self.replan_max_propagation_shift_m = float(os.environ.get('REPLAN_MAX_PROPAGATION_SHIFT_M', '2.0'))
         self.disturbance_seen = False
         print(f"[CONFIG] disturbance_enabled={self.disturbance['enabled']} start={self.disturbance['start']:.2f}s end={self.disturbance['end']:.2f}s mag={self.disturbance['magnitude']:.1f}N")
         print(f"[CONFIG] footstep_replanning={self.enable_footstep_replanning} replan_only_after_disturbance={self.replan_only_after_disturbance}")
-        self.wbc_recovery_duration = 1.50
+        self.wbc_recovery_duration = 3.0
 
         self.run_metrics = {
             'max_tau_nm': 0.0,
@@ -220,7 +220,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         }
 
         self.save_plots_as_images = True
-        self.show_plots_interactive = bool(os.environ.get('DISPLAY'))
+        self.show_plots_interactive = False
         self.plots_output_root = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'plots'
@@ -337,14 +337,13 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
     def _should_replan_footstep(self, current_phase, current_step_idx):
         if not self.enable_footstep_replanning:
             return False
-        if current_phase != 'ss':
-            return False
         if current_step_idx is None:
             return False
         if current_step_idx + 1 >= len(self.footstep_planner.plan):
             return False
-        # Freeze replanning before impact only in true no-disturbance baselines.
-        if self.replan_only_after_disturbance and (not self.disturbance['enabled']) and (not self.disturbance_seen):
+        
+        # Abilita il replanning SOLTANTO durante il periodo di instabilità o nel transient dopo la spinta.
+        if self.replan_only_after_disturbance and not self._is_recovery_mode_active():
             return False
         return True
 
@@ -370,11 +369,13 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         if step_norm > self.replan_max_step_radius_m and step_norm > 1e-9:
             candidate_xy = support_xy + (self.replan_max_step_radius_m / step_norm) * step_vec
 
-        support_id = support_step['foot_id']
-        if support_id == 'lfoot':
-            candidate_xy[1] = min(candidate_xy[1], support_xy[1] - self.replan_min_lateral_clearance_m)
-        else:
-            candidate_xy[1] = max(candidate_xy[1], support_xy[1] + self.replan_min_lateral_clearance_m)
+        # RIMOZIONE LIMITI LATERALI ANTI-COMPENETRAZIONE:
+        # Come nell'MPC, permettiamo matematicamente passi incrociati se necessari per recuperare equilibrio.
+        # support_id = support_step['foot_id']
+        # if support_id == 'lfoot':
+        #     candidate_xy[1] = min(candidate_xy[1], support_xy[1] - self.replan_min_lateral_clearance_m)
+        # else:
+        #     candidate_xy[1] = max(candidate_xy[1], support_xy[1] + self.replan_min_lateral_clearance_m)
 
         return candidate_xy
         
@@ -562,13 +563,15 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.desired['torso']['acc'] = np.zeros(3)
 
         # 6. WBC computations (Inverse Dynamics)
-        recovery_mode = self._is_recovery_mode_active()
+        # Disabilitiamo il recovery_mode nel WBC per evitare instabilità (snap) sui gain
+        # come ipotizzato, evitando che il robot cada "dopo" aver superato la botta.
+        wbc_recovery_mode = False
         commands, wbc_ok, wbc_msg = self.id_strict.get_joint_torques(
             self.desired,
             self.current,
             swing_foot_id,
             optimal_forces,
-            recovery_mode=recovery_mode
+            recovery_mode=wbc_recovery_mode
         )
 
         if not wbc_ok:
@@ -577,7 +580,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 self.current,
                 swing_foot_id,
                 optimal_forces,
-                recovery_mode=recovery_mode
+                recovery_mode=wbc_recovery_mode
             )
             if relaxed_ok:
                 commands = relaxed_commands

@@ -306,7 +306,7 @@ class InverseDynamics:
         tasks = ['lfoot', 'rfoot', 'com', 'torso', 'base', 'joints']
 
         weights = {'lfoot': 5., 'rfoot': 5., 'com': 10., 'torso': 4.0, 'base': 2.0, 'joints': 4.5}
-
+        
         pos_gains = {'lfoot': 500., 'rfoot': 500., 'com': 100., 'torso': 80., 'base': 50., 'joints': 90.0}
         vel_gains = {'lfoot': 60., 'rfoot': 60., 'com': 20., 'torso': 20., 'base': 10., 'joints': 14.0}
 

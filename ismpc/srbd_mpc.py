@@ -18,9 +18,9 @@ class SrbdMpc:
         self.mu = params['µ']
         self.g = [0, 0, -params['g']]
         self.debug_verbose = os.environ.get('MPC_DEBUG_VERBOSE', '0').strip().lower() in ['1', 'true', 'yes']
-        self.no_replan_tolerance_m = float(os.environ.get('MPC_NO_REPLAN_TOL_M', '0.01'))
+        self.no_replan_tolerance_m = float(os.environ.get('MPC_NO_REPLAN_TOL_M', '0.10'))
         self.max_step_length_m = float(os.environ.get('MPC_MAX_STEP_LENGTH_M', '0.35'))
-        self.min_lateral_clearance_m = float(os.environ.get('MPC_MIN_LATERAL_CLEARANCE_M', '0.12'))
+        self.min_lateral_clearance_m = float(os.environ.get('MPC_MIN_LATERAL_CLEARANCE_M', '0.05'))
         self.fz_sum_min_factor_ds = float(os.environ.get('MPC_FZ_SUM_MIN_FACTOR_DS', '0.70'))
         self.fz_sum_max_factor_ds = float(os.environ.get('MPC_FZ_SUM_MAX_FACTOR_DS', '1.35'))
         self.fz_sum_min_factor_ss = float(os.environ.get('MPC_FZ_SUM_MIN_FACTOR_SS', '0.60'))
@@ -164,17 +164,9 @@ class SrbdMpc:
             (self.p_swing[1] - support_foot_pos[1])**2 <= L_max**2 
         )
         
-        # VINCOLO ANTI-COMPENETRAZIONE (No Crossed Legs)
-        # La gamba sinistra (Y positivo) deve restare a sinistra della destra (Y negativo)
-        min_clearance = self.min_lateral_clearance_m
-        if support_id == 'lfoot':
-            # Piede d'appoggio è il sinistro, quindi p_swing è il destro.
-            # Il destro deve restare a DESTRA del sinistro (y_destro < y_sinistro - clearance)
-            self.opt.subject_to(self.p_swing[1] <= support_foot_pos[1] - min_clearance)
-        else:
-            # Piede d'appoggio è il destro, quindi p_swing è il sinistro.
-            # Il sinistro deve restare a SINISTRA del destro (y_sinistro > y_destro + clearance)
-            self.opt.subject_to(self.p_swing[1] >= support_foot_pos[1] + min_clearance)
+        # VINCOLI ANTI-COMPENETRAZIONE RIMOSSI: 
+        # Permettiamo esplicitamente i passi incrociati (cross-over steps)
+        # Indispensabili per non cadere quando la spinta spinge verso il piede di supporto.
         
     def compute_controls(self, current_state, t, nominal_plan=None, allow_footstep_replanning=True):
         planner_tick = int(round(t / self.delta))
@@ -425,7 +417,7 @@ class SrbdMpc:
         elif lock_to_nominal:
             # Keep MPC and executed foot trajectory aligned in nominal-mode runs,
             # while preserving feasibility with a tight tolerance around nominal.
-            tol = self.no_replan_tolerance_m
+            tol = 0.01  # tolleranza stretta prima della botta per fit perfetto
             self.opt.subject_to(self.opt.bounded(next_step_target[0] - tol, self.p_swing[0], next_step_target[0] + tol))
             self.opt.subject_to(self.opt.bounded(next_step_target[1] - tol, self.p_swing[1], next_step_target[1] + tol))
             cost += (10.0 * W_swing) * cs.sumsqr(self.p_swing - next_step_target)
