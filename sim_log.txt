@@ -1,0 +1,9 @@
+[CONFIG] use_model_torque_limits=True
+[CONFIG] ankle_torque_scale pitch=1.00 roll=1.00
+[CONFIG] disturbance_enabled=True start=5.00s end=5.15s mag=25.0N
+[CONFIG] footstep_replanning=True replan_only_after_disturbance=True
+void StateSet::setGlobalDefaults() ShaderPipeline disabled.
+Traceback (most recent call last):
+  File "/root/SRBD-MPC/ismpc/simulation.py", line 732, in <module>
+    viewer.run()
+KeyboardInterrupt

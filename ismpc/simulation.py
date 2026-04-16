@@ -482,29 +482,41 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             self.mpc_tick_offset = 0
 
         # After landing, whichever shift was chosen for recovery is propagated to the rest of the footstep plan.
+                # Riconvergenza alla traiettoria originale mediante decay
         current_step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
         phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
+
         if hasattr(self, 'phase_prev') and self.phase_prev == 'ss' and phase_now == 'ds':
             idx_landed = current_step_idx + 1
-            if current_step_idx is not None and idx_landed < len(self.nominal_plan):
+            if current_step_idx is not None and idx_landed < len(self.initial_plan):
+                # Calcoliamo lo shift TOTALE rispetto al piano ORIGINALE (initial_plan)
                 final_pos = self.footstep_planner.plan[idx_landed]['pos'][:2]
-                nom_pos = self.nominal_plan[idx_landed]['pos'][:2]
-                shift = final_pos - nom_pos
+                orig_pos = self.initial_plan[idx_landed]['pos'][:2]
+                total_shift = final_pos - orig_pos
 
-                shift_norm = np.linalg.norm(shift)
+                # Limita lo shift massimo per sicurezza
+                shift_norm = np.linalg.norm(total_shift)
                 if shift_norm > self.replan_max_propagation_shift_m and shift_norm > 1e-9:
-                    shift = (self.replan_max_propagation_shift_m / shift_norm) * shift
+                    total_shift = (self.replan_max_propagation_shift_m / shift_norm) * total_shift
                 
-                # Avoid crossing the legs!!
                 replan_active = (not self.replan_only_after_disturbance) or self.disturbance_seen
-                if self.enable_footstep_replanning and replan_active and np.linalg.norm(shift) > self.replan_min_shift_m:
-                    for i in range(idx_landed + 1, len(self.nominal_plan)):
-                        self.nominal_plan[i]['pos'][0] += shift[0]
-                        self.nominal_plan[i]['pos'][1] += shift[1]
-                        self.footstep_planner.plan[i]['pos'][0] += shift[0]
-                        self.footstep_planner.plan[i]['pos'][1] += shift[1]
+                if self.enable_footstep_replanning and replan_active:
+                    recovery_rate = 0.7 # 0.7 = rientro morbido, 0.0 = rientro istantaneo
+                    
+                    for i in range(idx_landed + 1, len(self.initial_plan)):
+                        k = i - idx_landed
+                        # Calcoliamo lo shift residuo da applicare alla posizione originale
+                        decayed_shift = total_shift * (recovery_rate ** k)
+                        
+                        # Ripristiniamo la posizione partendo da quella INIZIALE + lo shift residuo
+                        self.nominal_plan[i]['pos'][0] = self.initial_plan[i]['pos'][0] + decayed_shift[0]
+                        self.nominal_plan[i]['pos'][1] = self.initial_plan[i]['pos'][1] + decayed_shift[1]
+                        
+                        self.footstep_planner.plan[i]['pos'][0] = self.nominal_plan[i]['pos'][0]
+                        self.footstep_planner.plan[i]['pos'][1] = self.nominal_plan[i]['pos'][1]
                         
         self.phase_prev = phase_now
+
 
         optimal_forces = self.mpc.get_buffered_forces(self.mpc_tick_offset)
         target_state = self.mpc.get_buffered_state(self.mpc_tick_offset)
