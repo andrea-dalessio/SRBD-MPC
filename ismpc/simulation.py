@@ -180,9 +180,9 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.max_consecutive_mpc_failures = 8
         self.mpc_fail_count = 0
         disturbance_enabled = os.environ.get('DISTURBANCE_ENABLED', '1').strip().lower() not in ['0', 'false', 'no']
-        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '4.80'))
-        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '4.95'))
-        disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '25.0'))
+        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.0'))
+        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '5.15'))
+        disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '50.0'))
         disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '1').strip().lower() not in ['0', 'false', 'no']
         self.disturbance = {
             'enabled': disturbance_enabled,
@@ -501,7 +501,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 
                 replan_active = (not self.replan_only_after_disturbance) or self.disturbance_seen
                 if self.enable_footstep_replanning and replan_active:
-                    recovery_rate = 0.7 # 0.7 = rientro morbido, 0.0 = rientro istantaneo
+                    recovery_rate = 0.7
                     
                     for i in range(idx_landed + 1, len(self.initial_plan)):
                         k = i - idx_landed
