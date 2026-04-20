@@ -44,6 +44,43 @@ class Logger():
                 self.log['commands'] = []
             self.log['commands'].append(commands)
 
+    @staticmethod
+    def _quat_wxyz_to_rpy_deg(quat_array):
+        quat = np.asarray(quat_array, dtype=float)
+        if quat.ndim != 2 or quat.shape[1] != 4:
+            raise ValueError("Quaternion array must have shape (N, 4)")
+
+        norm = np.linalg.norm(quat, axis=1, keepdims=True)
+        norm = np.where(norm < 1e-12, 1.0, norm)
+        quat = quat / norm
+
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+        pitch_arg = 2.0 * (w * y - z * x)
+        pitch = np.arcsin(np.clip(pitch_arg, -1.0, 1.0))
+        yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        yaw = np.unwrap(yaw)
+
+        return np.rad2deg(np.vstack((roll, pitch, yaw)).T)
+
+    def _extract_disturbance_impulses(self):
+        events = self.log.get('disturbances', [])
+        if len(events) <= 1:
+            return events
+
+        times = np.array([e['time'] for e in events], dtype=float)
+        dt = np.diff(times)
+        dt = dt[dt > 1e-7]
+        nominal_dt = np.median(dt) if dt.size > 0 else 0.01
+        gap_threshold = max(2.5 * nominal_dt, 1e-3)
+
+        impulses = [events[0]]
+        for i in range(1, len(events)):
+            if (times[i] - times[i - 1]) > gap_threshold:
+                impulses.append(events[i])
+
+        return impulses
+
     def show_all_plots(self, save_dir=None, show_plots=True):
         print("Visualizzazione dei grafici in corso...")
         saved_files = []
@@ -65,152 +102,222 @@ class Logger():
             return saved_files
 
         com_cur = np.array(self.log['current', 'com', 'pos'])
-        zmp_des = np.array(self.log['desired', 'zmp', 'pos'])
-        zmp_cur = np.array(self.log['current', 'zmp', 'pos'])
         quat_des = np.array(self.log['desired', 'base', 'quat'])
         quat_cur = np.array(self.log['current', 'base', 'quat'])
-        
         time_steps = np.arange(len(com_des))
-        
-        fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle('Analisi SRBD-MPC ed Inverse Dynamics', fontsize=16)
 
-        # 1. CoM Tracking (X, Y, Z)
-        ax = axs[0, 0]
-        ax.plot(time_steps, com_des[:, 0], 'r--', label='X Des')
-        ax.plot(time_steps, com_cur[:, 0], 'r-', label='X Cur')
-        ax.plot(time_steps, com_des[:, 1], 'g--', label='Y Des')
-        ax.plot(time_steps, com_cur[:, 1], 'g-', label='Y Cur')
-        ax.plot(time_steps, com_des[:, 2], 'b--', label='Z Des')
-        ax.plot(time_steps, com_cur[:, 2], 'b-', label='Z Cur')
-        ax.set_title('CoM Tracking (Metri)')
-        ax.legend(loc='lower left', prop={'size': 7})
-        ax.grid(True)
+        plt.rcParams.update({
+            'font.size': 11,
+            'axes.titlesize': 13,
+            'axes.labelsize': 11,
+            'legend.fontsize': 9
+        })
 
-        # 2. Base orientation (XYZ quaternion components)
-        ax = axs[0, 1]
-        # In SRBD, attitude control replaces LIP-based ZMP control.
-        # Plot torso quaternion components X, Y, Z to assess stability.
-        ax.plot(time_steps, quat_cur[:, 1], label='Qx (Roll base)')
-        ax.plot(time_steps, quat_cur[:, 2], label='Qy (Pitch base)')
-        ax.plot(time_steps, quat_cur[:, 3], label='Qz (Yaw base)')
-        ax.set_title('Base Orientation (Quaternions Tracking)')
-        ax.set_ylabel('Quat Value')
-        ax.legend(loc='lower left')
-        ax.grid(True)
-
-        # 3. Vertical forces (GRF)
-        ax = axs[1, 0]
-        if 'forces' in self.log and len(self.log['forces']) > 0:
-            forces = np.array(self.log['forces']) # Shape (T, 24)
-            # Recall that U is [fx, fy, fz] x 4 for left and x 4 for right
-            # Total Fz = sum of indices 2, 5, 8, 11 (left) and 14, 17, 20, 23 (right)
-            fz_left = np.sum(forces[:, [2, 5, 8, 11]], axis=1)
-            fz_right = np.sum(forces[:, [14, 17, 20, 23]], axis=1)
-            fz_tot = fz_left + fz_right
-            ax.plot(time_steps, fz_tot, 'k-', label='Fz Totale (~376 N)')
-            ax.plot(time_steps, fz_left, 'b-', label='Fz Left', alpha=0.7)
-            ax.plot(time_steps, fz_right, 'r-', label='Fz Right', alpha=0.7)
-            ax.set_title('Ground Reaction Forces Z (Newton)')
-            ax.legend()
-        else:
-            ax.set_title('Forze non loggate')
-        ax.grid(True)
-
-        # 4. WBC inverse dynamics torques
-        ax = axs[1, 1]
-        if 'commands' in self.log and len(self.log['commands']) > 0:
-            commands = np.array(self.log['commands'])
-            # Show torques for the first 6 logged joints (e.g., hip and ankle)
-            for i in range(min(6, commands.shape[1])):
-                ax.plot(time_steps, commands[:, i], label=f'Joint {i} Tau')
-            ax.set_title('Inverse Dynamics Torques (WBC)')
-            ax.set_ylabel('Nm')
-            ax.legend(prop={'size': 7})
-        else:
-            ax.set_title('Torques non loggati')
-        ax.grid(True)
-
-        plt.tight_layout()
-        save_figure(fig, 'overview_tracking.png')
-        
-        # New figure for footsteps
+        # Figure 1: Footsteps + CoM map + one impulse arrow per disturbance window
         if hasattr(self, 'initial_plan') and self.initial_plan is not None:
-            fig2, ax2 = plt.subplots(figsize=(8, 10))
-            fig2.suptitle('Footstep Replanning (2D Map)', fontsize=16)
+            fig1, ax1 = plt.subplots(figsize=(9.5, 10.0))
+            fig1.suptitle('Footstep Map and Disturbance Impulses', fontsize=16)
 
-            # Plot initial footprints
+            initial_labels_done = {'lfoot': False, 'rfoot': False}
+
             for i, step in enumerate(self.initial_plan):
                 x, y, z = step['pos']
                 color = 'tab:blue' if step['foot_id'] == 'lfoot' else 'tab:green'
-                ax2.plot(x, y, marker='s', markersize=30, color=color, alpha=0.2)
-                ax2.text(x, y, str(i), color=color, fontsize=14, ha='center', va='center', fontweight='bold')
+                foot_lbl = 'Left Footsteps (nominal)' if step['foot_id'] == 'lfoot' else 'Right Footsteps (nominal)'
+                ax1.scatter(
+                    x,
+                    y,
+                    s=520,
+                    marker='s',
+                    color=color,
+                    alpha=0.22,
+                    edgecolors='none',
+                    label=foot_lbl if not initial_labels_done[step['foot_id']] else None
+                )
+                initial_labels_done[step['foot_id']] = True
+                ax1.text(x, y, str(i), color=color, fontsize=12, ha='center', va='center', fontweight='bold')
 
-            # Plot post-impact footprints
             if hasattr(self, 'post_impact_plan') and self.post_impact_plan is not None:
+                replanned_label_done = False
                 for i, step in enumerate(self.post_impact_plan):
                     x, y, z = step['pos']
-                    ax2.plot(x, y, marker='s', markersize=30, markeredgecolor='red', markerfacecolor='none', linestyle='--', linewidth=3)
-                    ax2.text(x, y+0.04, f"{i}'", color='red', fontsize=14, ha='center', va='center', fontweight='bold')
+                    ax1.scatter(
+                        x,
+                        y,
+                        s=520,
+                        marker='s',
+                        facecolors='none',
+                        edgecolors='red',
+                        linewidths=2.2,
+                        label='Footsteps (replanned)' if not replanned_label_done else None
+                    )
+                    replanned_label_done = True
+                    ax1.text(x, y + 0.035, f"{i}'", color='red', fontsize=11, ha='center', va='center', fontweight='bold')
 
-            # CoM trajectory on the footsteps map
-            ax2.plot(com_cur[:, 0], com_cur[:, 1], 'k-', linewidth=2.0, label='CoM Current')
-            ax2.plot(com_des[:, 0], com_des[:, 1], 'k--', linewidth=1.5, alpha=0.8, label='CoM Desired')
+            ax1.plot(com_cur[:, 0], com_cur[:, 1], 'k-', linewidth=2.3, label='CoM Current')
+            ax1.plot(com_des[:, 0], com_des[:, 1], 'k--', linewidth=1.7, alpha=0.9, label='CoM Desired')
 
-            # Markers for applied external disturbances
-            if len(self.log['disturbances']) > 0:
-                for event in self.log['disturbances']:
+            impulse_events = self._extract_disturbance_impulses()
+            if len(impulse_events) > 0:
+                map_span = max(np.ptp(com_cur[:, 0]), np.ptp(com_cur[:, 1]), 0.4)
+                arrow_len = max(0.08, 0.12 * map_span)
+                for i, event in enumerate(impulse_events):
                     p = event['com_xy']
                     f = event['force'][:2]
                     fn = np.linalg.norm(f)
                     if fn > 1e-8:
                         f_dir = f / fn
-                        ax2.quiver(
+                        ax1.quiver(
                             p[0],
                             p[1],
-                            f_dir[0],
-                            f_dir[1],
+                            arrow_len * f_dir[0],
+                            arrow_len * f_dir[1],
                             angles='xy',
                             scale_units='xy',
-                            scale=8.0,
+                            scale=1.0,
                             color='tab:orange',
-                            width=0.006
+                            width=0.006,
+                            headwidth=3.8,
+                            headlength=5.0,
+                            label='Disturbance impulse (start of interval)' if i == 0 else None
+                        )
+                        ax1.text(
+                            p[0],
+                            p[1] + 0.03,
+                            f"t={event['time']:.2f}s",
+                            color='tab:orange',
+                            fontsize=9,
+                            ha='center'
                         )
 
-            ax2.set_xlabel('X (m)')
-            ax2.set_ylabel('Y (m)')
-            ax2.set_title('Confronto Traiettoria (Trasparente: nominale | Bordata Rossa: ri-pianificata)')
-            ax2.grid(True)
-            ax2.axis('equal')
-            ax2.legend(loc='best')
-            fig2.tight_layout()
-            save_figure(fig2, 'footsteps_map.png')
+            ax1.set_xlabel('X [m]')
+            ax1.set_ylabel('Y [m]')
+            ax1.set_title('Footstep Replanning Map')
+            ax1.grid(True, alpha=0.35)
+            ax1.axis('equal')
+            ax1.legend(loc='best')
+            fig1.tight_layout()
+            save_figure(fig1, '1_footsteps_map.png')
 
-        # New figure for Torso vs Feet Yaw
-        fig3, ax3 = plt.subplots(figsize=(10, 5))
-        fig3.suptitle('Torso Yaw vs Feet Yaw Tracking', fontsize=14)
-        
-        w, x, y, z = quat_cur[:, 0], quat_cur[:, 1], quat_cur[:, 2], quat_cur[:, 3]
-        base_yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y**2 + z**2))
-        
-        lfoot_cur = np.array(self.log['current', 'lfoot', 'pos'])
-        rfoot_cur = np.array(self.log['current', 'rfoot', 'pos'])
-        lfoot_yaw = lfoot_cur[:, 2]
-        rfoot_yaw = rfoot_cur[:, 2]
-        avg_feet_yaw = (lfoot_yaw + rfoot_yaw) / 2.0
-        
-        ax3.plot(time_steps, base_yaw, 'b-', linewidth=2, label='Torso Yaw (Current)')
-        ax3.plot(time_steps, avg_feet_yaw, 'k--', linewidth=2, label='Average Feet Yaw (Target)')
-        ax3.plot(time_steps, lfoot_yaw, 'g-', alpha=0.5, label='Left Foot Yaw')
-        ax3.plot(time_steps, rfoot_yaw, 'r-', alpha=0.5, label='Right Foot Yaw')
-        
-        ax3.set_xlabel('Time Steps')
-        ax3.set_ylabel('Yaw (Radians)')
-        ax3.set_title('Confronto Orientamento Torso e Piedi')
-        ax3.grid(True)
-        ax3.legend()
+        forces_per_contact = None
+        if 'forces' in self.log and len(self.log['forces']) > 0:
+            forces = np.asarray(self.log['forces'], dtype=float)
+            if forces.ndim == 1:
+                forces = forces.reshape(1, -1)
+            if forces.shape[1] == 24:
+                forces_per_contact = forces.reshape(-1, 8, 3)
+
+        left_labels = ['L-P1 (+x,+y)', 'L-P2 (+x,-y)', 'L-P3 (-x,+y)', 'L-P4 (-x,-y)']
+        right_labels = ['R-P1 (+x,+y)', 'R-P2 (+x,-y)', 'R-P3 (-x,+y)', 'R-P4 (-x,-y)']
+        left_colors = ['tab:blue', 'tab:cyan', 'tab:purple', 'tab:olive']
+        right_colors = ['tab:green', 'tab:orange', 'tab:red', 'tab:brown']
+
+        def plot_foot_reaction(fig_title, fig_name, contact_indices, labels, colors):
+            fig, ax = plt.subplots(figsize=(12.8, 6.8))
+            fig.suptitle(fig_title, fontsize=16)
+
+            if forces_per_contact is None:
+                if 'forces' not in self.log or len(self.log['forces']) == 0:
+                    ax.set_title('Forze di reazione non loggate')
+                else:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        f"Formato forze non valido: atteso 24, trovato {np.asarray(self.log['forces']).shape[-1]}",
+                        transform=ax.transAxes,
+                        ha='center',
+                        va='center',
+                        fontsize=12
+                    )
+            else:
+                tf = np.arange(forces_per_contact.shape[0])
+                for local_i, contact_i in enumerate(contact_indices):
+                    ax.plot(
+                        tf,
+                        forces_per_contact[:, contact_i, 2],
+                        color=colors[local_i],
+                        linewidth=1.9,
+                        label=f"{labels[local_i]} - Fz"
+                    )
+
+                ax.axhline(500.0, color='gray', linestyle='--', linewidth=1.0, alpha=0.7, label='MPC Fz upper bound (500 N)')
+
+                foot_forces = forces_per_contact[:, contact_indices, 2]
+                y_min = min(-15.0, float(np.min(foot_forces) * 1.05))
+                y_max = max(80.0, float(np.max(foot_forces) * 1.08), 520.0)
+                ax.set_ylim(y_min, y_max)
+                ax.legend(loc='upper right', ncol=2)
+
+            ax.set_xlabel('Sample index')
+            ax.set_ylabel('Vertical force Fz [N]')
+            ax.grid(True, alpha=0.35)
+            fig.tight_layout()
+            save_figure(fig, fig_name)
+
+        # Figure 2: Left foot contact reaction forces
+        plot_foot_reaction(
+            'Reaction Forces per Contact Point - Left Foot',
+            '2_reaction_forces_left_foot.png',
+            [0, 1, 2, 3],
+            left_labels,
+            left_colors
+        )
+
+        # Figure 3: Right foot contact reaction forces
+        plot_foot_reaction(
+            'Reaction Forces per Contact Point - Right Foot',
+            '3_reaction_forces_right_foot.png',
+            [4, 5, 6, 7],
+            right_labels,
+            right_colors
+        )
+
+        if forces_per_contact is not None:
+            total_fz = np.sum(forces_per_contact[:, :, 2], axis=1)
+            print(
+                "[LOGGER] Total Fz stats [N] -> "
+                f"min={np.min(total_fz):.2f}, mean={np.mean(total_fz):.2f}, max={np.max(total_fz):.2f}"
+            )
+            left_max = np.max(forces_per_contact[:, 0:4, 2], axis=0)
+            right_max = np.max(forces_per_contact[:, 4:8, 2], axis=0)
+            print("[LOGGER] Max Left-foot contacts Fz [N]: " + ", ".join([f"{v:.2f}" for v in left_max]))
+            print("[LOGGER] Max Right-foot contacts Fz [N]: " + ", ".join([f"{v:.2f}" for v in right_max]))
+
+            if max(np.max(left_max), np.max(right_max)) > 580.0:
+                print("[LOGGER][WARN] Picchi Fz oltre 580N rilevati: controllare limiti/saturazioni MPC.")
+
+        # Figure 3: Body orientation (RPY) and CoM tracking
+        fig3, (ax3_top, ax3_bottom) = plt.subplots(2, 1, figsize=(13, 9.0), sharex=True)
+        fig3.suptitle('Body Orientation (RPY) and CoM Tracking', fontsize=16)
+
+        rpy_des_deg = self._quat_wxyz_to_rpy_deg(quat_des)
+        rpy_cur_deg = self._quat_wxyz_to_rpy_deg(quat_cur)
+
+        rpy_names = ['Roll', 'Pitch', 'Yaw']
+        rpy_colors = ['tab:red', 'tab:green', 'tab:blue']
+        for idx, (name, color) in enumerate(zip(rpy_names, rpy_colors)):
+            ax3_top.plot(time_steps, rpy_des_deg[:, idx], linestyle='--', color=color, linewidth=2.0, label=f'{name} desired')
+            ax3_top.plot(time_steps, rpy_cur_deg[:, idx], linestyle='-', color=color, linewidth=1.8, alpha=0.9, label=f'{name} current')
+
+        ax3_top.set_ylabel('Angle [deg]')
+        ax3_top.set_title('Body Orientation Tracking (Roll/Pitch/Yaw)')
+        ax3_top.grid(True, alpha=0.35)
+        ax3_top.legend(loc='best', ncol=2)
+
+        com_names = ['X', 'Y', 'Z']
+        com_colors = ['tab:red', 'tab:green', 'tab:blue']
+        for idx, (name, color) in enumerate(zip(com_names, com_colors)):
+            ax3_bottom.plot(time_steps, com_des[:, idx], linestyle='--', color=color, linewidth=2.0, label=f'CoM {name} desired')
+            ax3_bottom.plot(time_steps, com_cur[:, idx], linestyle='-', color=color, linewidth=1.8, alpha=0.9, label=f'CoM {name} current')
+
+        ax3_bottom.set_xlabel('Sample index')
+        ax3_bottom.set_ylabel('Position [m]')
+        ax3_bottom.set_title('Center of Mass Tracking')
+        ax3_bottom.grid(True, alpha=0.35)
+        ax3_bottom.legend(loc='best', ncol=2)
+
         fig3.tight_layout()
-        save_figure(fig3, 'yaw_tracking.png')
+        save_figure(fig3, '4_orientation_com_tracking_rpy.png')
 
         if len(saved_files) > 0:
             print("Plot salvati come immagini:")

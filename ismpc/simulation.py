@@ -180,8 +180,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.max_consecutive_mpc_failures = 8
         self.mpc_fail_count = 0
         disturbance_enabled = os.environ.get('DISTURBANCE_ENABLED', '1').strip().lower() not in ['0', 'false', 'no']
-        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.0'))
-        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '5.15'))
+        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.10'))
+        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '5.25'))
         disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '50.0'))
         disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '1').strip().lower() not in ['0', 'false', 'no']
         self.disturbance = {
