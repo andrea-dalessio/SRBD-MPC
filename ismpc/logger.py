@@ -28,7 +28,7 @@ class Logger():
         })
 
 
-    def log_data(self, desired, current, forces=None, commands=None):
+    def log_data(self, desired, current, forces=None, commands=None, measured_forces=None):
         for item in desired.keys():
             for level in desired[item].keys():
                 self.log['desired', item, level].append(desired[item][level])
@@ -43,6 +43,11 @@ class Logger():
             if 'commands' not in self.log:
                 self.log['commands'] = []
             self.log['commands'].append(commands)
+
+        if measured_forces is not None:
+            if 'measured_forces' not in self.log:
+                self.log['measured_forces'] = []
+            self.log['measured_forces'].append(measured_forces)
 
     @staticmethod
     def _quat_wxyz_to_rpy_deg(quat_array):
@@ -81,6 +86,24 @@ class Logger():
 
         return impulses
 
+    @staticmethod
+    def _moving_average(signal, window):
+        arr = np.asarray(signal, dtype=float)
+        if arr.size == 0:
+            return arr
+
+        win = max(1, int(window))
+        if win == 1 or arr.size < 3:
+            return arr.copy()
+
+        win = min(win, arr.size)
+
+        kernel = np.ones(win, dtype=float) / float(win)
+        pad_left = win // 2
+        pad_right = win - 1 - pad_left
+        padded = np.pad(arr, (pad_left, pad_right), mode='edge')
+        return np.convolve(padded, kernel, mode='valid')
+
     def show_all_plots(self, save_dir=None, show_plots=True):
         print("Visualizzazione dei grafici in corso...")
         saved_files = []
@@ -112,6 +135,7 @@ class Logger():
             'axes.labelsize': 11,
             'legend.fontsize': 9
         })
+        contact_ma_window = int(os.environ.get('PLOT_CONTACT_FORCE_MA_WINDOW', '20'))
 
         # Figure 1: Footsteps + CoM map + one impulse arrow per disturbance window
         if hasattr(self, 'initial_plan') and self.initial_plan is not None:
@@ -200,21 +224,32 @@ class Logger():
             save_figure(fig1, '1_footsteps_map.png')
 
         forces_per_contact = None
-        if 'forces' in self.log and len(self.log['forces']) > 0:
+        force_source = None
+        if 'measured_forces' in self.log and len(self.log['measured_forces']) > 0:
+            measured = np.asarray(self.log['measured_forces'], dtype=float)
+            if measured.ndim == 1:
+                measured = measured.reshape(1, -1)
+            if measured.shape[1] == 24:
+                forces_per_contact = measured.reshape(-1, 8, 3)
+                force_source = 'measured'
+
+        if forces_per_contact is None and 'forces' in self.log and len(self.log['forces']) > 0:
             forces = np.asarray(self.log['forces'], dtype=float)
             if forces.ndim == 1:
                 forces = forces.reshape(1, -1)
             if forces.shape[1] == 24:
                 forces_per_contact = forces.reshape(-1, 8, 3)
+                force_source = 'mpc'
 
         left_labels = ['L-P1 (+x,+y)', 'L-P2 (+x,-y)', 'L-P3 (-x,+y)', 'L-P4 (-x,-y)']
         right_labels = ['R-P1 (+x,+y)', 'R-P2 (+x,-y)', 'R-P3 (-x,+y)', 'R-P4 (-x,-y)']
-        left_colors = ['tab:blue', 'tab:cyan', 'tab:purple', 'tab:olive']
-        right_colors = ['tab:green', 'tab:orange', 'tab:red', 'tab:brown']
+        left_colors = ['#0B3C5D', '#1F77B4', '#2E86DE', '#4FC3F7']
+        right_colors = ['#7F1D1D', '#C62828', '#EF5350', '#FF8A65']
 
         def plot_foot_reaction(fig_title, fig_name, contact_indices, labels, colors):
             fig, ax = plt.subplots(figsize=(12.8, 6.8))
-            fig.suptitle(fig_title, fontsize=16)
+            title_suffix = ' (measured from physics)' if force_source == 'measured' else ' (MPC command)'
+            fig.suptitle(fig_title + title_suffix, fontsize=16)
 
             if forces_per_contact is None:
                 if 'forces' not in self.log or len(self.log['forces']) == 0:
@@ -232,21 +267,39 @@ class Logger():
             else:
                 tf = np.arange(forces_per_contact.shape[0])
                 for local_i, contact_i in enumerate(contact_indices):
+                    fz_smoothed = self._moving_average(forces_per_contact[:, contact_i, 2], contact_ma_window)
                     ax.plot(
                         tf,
-                        forces_per_contact[:, contact_i, 2],
+                        fz_smoothed,
                         color=colors[local_i],
-                        linewidth=1.9,
-                        label=f"{labels[local_i]} - Fz"
+                        linewidth=2.1,
+                        label=f"{labels[local_i]} - Fz MA({contact_ma_window})"
                     )
 
-                ax.axhline(500.0, color='gray', linestyle='--', linewidth=1.0, alpha=0.7, label='MPC Fz upper bound (500 N)')
+                foot_fz = forces_per_contact[:, contact_indices, 2]
+                foot_fz_sum = np.sum(foot_fz, axis=1)
+                foot_fz_sum_smoothed = self._moving_average(foot_fz_sum, contact_ma_window)
+                ax.plot(
+                    tf,
+                    foot_fz_sum_smoothed,
+                    color='#111111',
+                    linewidth=2.8,
+                    linestyle='--',
+                    label=f"Sum(4 contacts) - Fz MA({contact_ma_window})"
+                )
+                ax.axhline(
+                    400.0,
+                    color='#666666',
+                    linewidth=1.4,
+                    linestyle=':',
+                    label='Reference: 400 N'
+                )
 
                 foot_forces = forces_per_contact[:, contact_indices, 2]
                 y_min = min(-15.0, float(np.min(foot_forces) * 1.05))
-                y_max = max(80.0, float(np.max(foot_forces) * 1.08), 520.0)
+                y_max = max(80.0, float(np.max(foot_forces) * 1.08), float(np.max(foot_fz_sum) * 1.08), 520.0)
                 ax.set_ylim(y_min, y_max)
-                ax.legend(loc='upper right', ncol=2)
+                ax.legend(loc='upper right', ncol=1)
 
             ax.set_xlabel('Sample index')
             ax.set_ylabel('Vertical force Fz [N]')
@@ -274,8 +327,9 @@ class Logger():
 
         if forces_per_contact is not None:
             total_fz = np.sum(forces_per_contact[:, :, 2], axis=1)
+            source_label = 'measured' if force_source == 'measured' else 'mpc'
             print(
-                "[LOGGER] Total Fz stats [N] -> "
+                f"[LOGGER] Total Fz stats ({source_label}) [N] -> "
                 f"min={np.min(total_fz):.2f}, mean={np.mean(total_fz):.2f}, max={np.max(total_fz):.2f}"
             )
             left_max = np.max(forces_per_contact[:, 0:4, 2], axis=0)
@@ -283,7 +337,7 @@ class Logger():
             print("[LOGGER] Max Left-foot contacts Fz [N]: " + ", ".join([f"{v:.2f}" for v in left_max]))
             print("[LOGGER] Max Right-foot contacts Fz [N]: " + ", ".join([f"{v:.2f}" for v in right_max]))
 
-            if max(np.max(left_max), np.max(right_max)) > 580.0:
+            if force_source == 'mpc' and max(np.max(left_max), np.max(right_max)) > 580.0:
                 print("[LOGGER][WARN] Picchi Fz oltre 580N rilevati: controllare limiti/saturazioni MPC.")
 
         # Figure 3: Body orientation (RPY) and CoM tracking

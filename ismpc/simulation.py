@@ -180,8 +180,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.max_consecutive_mpc_failures = 8
         self.mpc_fail_count = 0
         disturbance_enabled = os.environ.get('DISTURBANCE_ENABLED', '1').strip().lower() not in ['0', 'false', 'no']
-        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.10'))
-        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '5.25'))
+        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.85'))
+        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '6.00'))
         disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '50.0'))
         disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '1').strip().lower() not in ['0', 'false', 'no']
         self.disturbance = {
@@ -333,6 +333,60 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 f"| F=[{ext_force[0]:.2f}, {ext_force[1]:.2f}, 0.00]N "
                 f"| frame=robot-left | dot(forward,force)={orthogonality:.4f}"
             )
+
+    def _get_measured_contact_forces(self):
+        # Map physics contact forces to the 8 nominal foot contact points used by MPC.
+        # Contacts too far from both feet are ignored (e.g. accidental non-foot contacts).
+        lfoot_pose = self.current['lfoot']['pos']
+        rfoot_pose = self.current['rfoot']['pos']
+        p_left_xy = np.array(lfoot_pose[3:5], dtype=float)
+        p_right_xy = np.array(rfoot_pose[3:5], dtype=float)
+        yaw_l = float(lfoot_pose[2])
+        yaw_r = float(rfoot_pose[2])
+
+        d = self.params['foot_size'] / 2.0
+        corners_xy = []
+
+        cos_l, sin_l = np.cos(yaw_l), np.sin(yaw_l)
+        for x_sign in [1, -1]:
+            for y_sign in [1, -1]:
+                dx = x_sign * d
+                dy = y_sign * d
+                rx = dx * cos_l - dy * sin_l
+                ry = dx * sin_l + dy * cos_l
+                corners_xy.append(np.array([p_left_xy[0] + rx, p_left_xy[1] + ry], dtype=float))
+
+        cos_r, sin_r = np.cos(yaw_r), np.sin(yaw_r)
+        for x_sign in [1, -1]:
+            for y_sign in [1, -1]:
+                dx = x_sign * d
+                dy = y_sign * d
+                rx = dx * cos_r - dy * sin_r
+                ry = dx * sin_r + dy * cos_r
+                corners_xy.append(np.array([p_right_xy[0] + rx, p_right_xy[1] + ry], dtype=float))
+
+        corners_xy = np.array(corners_xy, dtype=float)
+        measured = np.zeros((8, 3), dtype=float)
+        max_assign_distance_xy = 0.20
+
+        collision_result = self.world.getLastCollisionResult()
+        for contact in collision_result.getContacts():
+            point = np.array(contact.point, dtype=float)
+            force = np.array(contact.force, dtype=float)
+            if not (np.all(np.isfinite(point)) and np.all(np.isfinite(force))):
+                continue
+
+            # DART contact-force sign may depend on body indexing.
+            # For reaction-force plotting we care about the normal-load magnitude.
+            force[2] = abs(force[2])
+
+            deltas = corners_xy - point[0:2]
+            dists = np.linalg.norm(deltas, axis=1)
+            nearest_idx = int(np.argmin(dists))
+            if dists[nearest_idx] <= max_assign_distance_xy:
+                measured[nearest_idx] += force
+
+        return measured.reshape(24)
 
     def _should_replan_footstep(self, current_phase, current_step_idx):
         if not self.enable_footstep_replanning:
@@ -623,7 +677,14 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         current_for_log = copy.deepcopy(self.current)
         if 'inertia' in current_for_log:
             del current_for_log['inertia'] 
-        self.logger.log_data(self.desired, current_for_log, optimal_forces, commands)
+        measured_contact_forces = self._get_measured_contact_forces()
+        self.logger.log_data(
+            self.desired,
+            current_for_log,
+            optimal_forces,
+            commands,
+            measured_forces=measured_contact_forces
+        )
     
         self.time += self.params['world_time_step']
      
