@@ -183,7 +183,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.85'))
         disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '6.00'))
         disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '50.0'))
-        disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '1').strip().lower() not in ['0', 'false', 'no']
+        disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '0').strip().lower() not in ['0', 'false', 'no']
         self.disturbance = {
             'enabled': disturbance_enabled,
             'start': disturbance_start,
@@ -720,25 +720,54 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         l_foot_spatial_velocity = self.lsole.getSpatialVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
         r_foot_spatial_velocity = self.rsole.getSpatialVelocity(relativeTo=dart.dynamics.Frame.World(), inCoordinatesOf=dart.dynamics.Frame.World())
 
-        # 4. Contact forces, zmp estimation
+        # 4. Contact forces, ZMP raw and robust CoP (center of pressure) estimation
         force = np.zeros(3)
         collision_result = self.world.getLastCollisionResult()
-        for contact in collision_result.getContacts():
+        contacts = list(collision_result.getContacts())
+        for contact in contacts:
             force += contact.force
 
-        zmp = np.zeros(3)
+        # Keep the original (raw) ZMP computation for debugging/diagnostics
+        zmp_raw = np.zeros(3)
         if force[2] <= 0.1:
-            zmp = np.array([0., 0., 0.])
+            zmp_raw = np.array([0., 0., 0.])
         else:
-            zmp[2] = com_position[2] - force[2] / (self.hrp4.getMass() * self.params['g'] / 0.72)
-            for contact in collision_result.getContacts():
+            zmp_raw[2] = com_position[2] - force[2] / (self.hrp4.getMass() * self.params['g'] / 0.72)
+            for contact in contacts:
                 if contact.force[2] <= 0.1: continue
-                zmp[0] += (contact.point[0] * contact.force[2] / force[2] + (zmp[2] - contact.point[2]) * contact.force[0] / force[2])
-                zmp[1] += (contact.point[1] * contact.force[2] / force[2] + (zmp[2] - contact.point[2]) * contact.force[1] / force[2])
-            
-            # Clipping
+                zmp_raw[0] += (contact.point[0] * contact.force[2] / force[2] + (zmp_raw[2] - contact.point[2]) * contact.force[0] / force[2])
+                zmp_raw[1] += (contact.point[1] * contact.force[2] / force[2] + (zmp_raw[2] - contact.point[2]) * contact.force[1] / force[2])
+
+            # Clipping (keep for raw value)
             midpoint = (l_foot_position + r_foot_position) / 2.
-            zmp = np.clip(zmp, midpoint - 0.3, midpoint + 0.3)
+            zmp_raw = np.clip(zmp_raw, midpoint - 0.3, midpoint + 0.3)
+
+        # Robust CoP (projected on ground plane) using only normal loads to avoid amplification from z-estimate
+        cop = np.zeros(3)
+        total_fz = 0.0
+        sum_xy = np.zeros(2)
+        min_contact_z = None
+        for contact in contacts:
+            fz = float(contact.force[2])
+            if fz <= 1e-6:
+                continue
+            pt = np.array(contact.point, dtype=float)
+            sum_xy += pt[0:2] * fz
+            total_fz += fz
+            if min_contact_z is None or pt[2] < min_contact_z:
+                min_contact_z = pt[2]
+
+        if total_fz > 1e-6:
+            cop_xy = sum_xy / total_fz
+            cop_z = float(min_contact_z) if min_contact_z is not None else 0.0
+            cop = np.array([cop_xy[0], cop_xy[1], cop_z])
+        else:
+            # fallback: approximate CoP as projection of CoM on ground (or previous)
+            cop = np.array([com_position[0], com_position[1], 0.0])
+
+        # Expose both for logging/diagnostics: 'zmp' -> robust CoP, 'zmp_raw' -> original estimate
+        zmp = cop
+        self.current_zmp_raw = zmp_raw
         
         # 5. Quaternions
         quat_xyzw = R.from_matrix(base_rot_matrix).as_quat()

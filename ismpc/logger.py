@@ -127,6 +127,12 @@ class Logger():
         com_cur = np.array(self.log['current', 'com', 'pos'])
         quat_des = np.array(self.log['desired', 'base', 'quat'])
         quat_cur = np.array(self.log['current', 'base', 'quat'])
+        zmp_cur = None
+        zmp_des = None
+        if ('current', 'zmp', 'pos') in self.log and len(self.log['current', 'zmp', 'pos']) > 0:
+            zmp_cur = np.array(self.log['current', 'zmp', 'pos'])
+        if ('desired', 'zmp', 'pos') in self.log and len(self.log['desired', 'zmp', 'pos']) > 0:
+            zmp_des = np.array(self.log['desired', 'zmp', 'pos'])
         time_steps = np.arange(len(com_des))
 
         plt.rcParams.update({
@@ -180,6 +186,38 @@ class Logger():
 
             ax1.plot(com_cur[:, 0], com_cur[:, 1], 'k-', linewidth=2.3, label='CoM Current')
             ax1.plot(com_des[:, 0], com_des[:, 1], 'k--', linewidth=1.7, alpha=0.9, label='CoM Desired')
+            if zmp_cur is not None:
+                # Robustify CoP trace: remove extreme outliers by clipping to percentiles
+                try:
+                    x = zmp_cur[:, 0].astype(float)
+                    y = zmp_cur[:, 1].astype(float)
+                    # percentile clipping to remove impulses
+                    lo_x, hi_x = np.percentile(x, [1.0, 99.0])
+                    lo_y, hi_y = np.percentile(y, [1.0, 99.0])
+                    x_clipped = np.clip(x, lo_x, hi_x)
+                    y_clipped = np.clip(y, lo_y, hi_y)
+                    # Smooth with moving average (same window used for contact forces)
+                    x_s = self._moving_average(x_clipped, contact_ma_window)
+                    y_s = self._moving_average(y_clipped, contact_ma_window)
+                    # Adjust lengths if moving_average pads
+                    n = min(len(x_s), len(y_s))
+                    ax1.plot(x_s[:n], y_s[:n], color='tab:red', linewidth=1.8, alpha=0.95, label='CoP Current (smoothed)')
+                    ax1.scatter(x_s[0], y_s[0], color='tab:red', s=24, marker='o', label='CoP start')
+                except Exception:
+                    ax1.plot(zmp_cur[:, 0], zmp_cur[:, 1], color='tab:red', linewidth=1.8, alpha=0.95, label='CoP Current')
+                    ax1.scatter(zmp_cur[0, 0], zmp_cur[0, 1], color='tab:red', s=24, marker='o', label='CoP start')
+            if zmp_des is not None:
+                try:
+                    xd = zmp_des[:, 0].astype(float)
+                    yd = zmp_des[:, 1].astype(float)
+                    xd_cl = np.clip(xd, np.percentile(xd, 1.0), np.percentile(xd, 99.0))
+                    yd_cl = np.clip(yd, np.percentile(yd, 1.0), np.percentile(yd, 99.0))
+                    xd_s = self._moving_average(xd_cl, contact_ma_window)
+                    yd_s = self._moving_average(yd_cl, contact_ma_window)
+                    m = min(len(xd_s), len(yd_s))
+                    ax1.plot(xd_s[:m], yd_s[:m], color='tab:red', linestyle='--', linewidth=1.2, alpha=0.65, label='CoP Desired (smoothed)')
+                except Exception:
+                    ax1.plot(zmp_des[:, 0], zmp_des[:, 1], color='tab:red', linestyle='--', linewidth=1.2, alpha=0.65, label='CoP Desired')
 
             impulse_events = self._extract_disturbance_impulses()
             if len(impulse_events) > 0:

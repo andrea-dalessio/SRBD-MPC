@@ -1,0 +1,1 @@
+/home/dalex/AIRO_2024-2025/Autonomous_Mobile_Robotics/project/srbd_env/bin/python3.10: can't open file '/home/dalex/AIRO_2024-2025/Autonomous_Mobile_Robotics/project/SRBD-MPC/SRBD-MPC/ismpc/simulation.py': [Errno 2] No such file or directory
