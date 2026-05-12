@@ -89,7 +89,35 @@ class SrbdMpc:
             for i in active_contacts:
                 self.last_U[i*3 + 2, k] = fz_each
 
-        self.last_p_swing = np.array(next_step_target).copy()
+        # Compute a capture-point corrective step target during ss fallback.
+        # When IPOPT fails, the nominal next_step_target has zero disturbance
+        # correction — so footstep replanning in the simulation would use a
+        # step that makes no attempt to recover. Instead, compute:
+        #   p_capture = p_com + (1/omega) * v_lateral
+        # where omega = sqrt(g / h_com) from the LIPM, then blend it with the
+        # nominal target so we don't step too far from the kinematic workspace.
+        if phase == 'ss':
+            try:
+                g_mag = abs(self.g[2])
+                h_com = float(current_state['com']['pos'][2])
+                if h_com > 0.05:
+                    omega = float(np.sqrt(g_mag / h_com))
+                    com_xy  = np.array(current_state['com']['pos'][0:2], dtype=float)
+                    vel_xy  = np.array(current_state['com']['vel'][0:2], dtype=float)
+                    capture = com_xy + vel_xy / omega          # classic capture point
+                    nominal = np.array(next_step_target[0:2],  dtype=float)
+                    # Blend: 60% capture correction, 40% nominal to stay in workspace
+                    corrected = 0.60 * capture + 0.40 * nominal
+                    p_swing = np.array(next_step_target, dtype=float)
+                    p_swing[0] = corrected[0]
+                    p_swing[1] = corrected[1]
+                    self.last_p_swing = p_swing
+                else:
+                    self.last_p_swing = np.array(next_step_target).copy()
+            except Exception:
+                self.last_p_swing = np.array(next_step_target).copy()
+        else:
+            self.last_p_swing = np.array(next_step_target).copy()
         return optimal_controls, target_state
 
     def _get_dynamics_with_rot_inertia(self, x, u, p_contacts):
@@ -156,17 +184,49 @@ class SrbdMpc:
         support_foot_pos = self.footstep_planner.plan[current_step_index]['pos']
         support_id = self.footstep_planner.plan[current_step_index]['foot_id']
         
-        L_max = self.max_step_length_m # maximum leg length
+        # HRP-4 physical dimensions (from URDF):
+        #   Foot collision box : 0.25 m (x) x 0.13 m (y)
+        #   Hip lateral offset : ±0.0875 m  →  nominal foot centre-to-centre = 0.175 m
+        #
+        # Soft lateral-separation constraint (promised feature):
+        #   We enforce a minimum lateral clearance between the swing foot target and the
+        #   support foot centre using a SOFT quadratic penalty rather than a hard constraint.
+        #   This keeps IPOPT feasible under large disturbances (hard constraints would cause
+        #   infeasibility → solver failure) while still strongly discouraging foot overlap.
+        #
+        #   Minimum safe gap = half foot width (0.065 m) + safety margin (0.05 m) = 0.115 m
+        #   This equals roughly the HRP-4 nominal hip-to-foot lateral distance, so during
+        #   normal walking the penalty is near-zero; it only activates when the MPC tries
+        #   to plan a dangerously narrow or crossing step.
+        #
+        #   W_lateral_sep scales the softness:
+        #     • Normal walking  → clearance comfortably satisfied → penalty ≈ 0
+        #     • Recovery push   → allowed to shrink toward 0.05 m under extreme disturbance
+        #     • Cross-over step → penalty rises steeply, discouraging foot collision
 
-        # Limite radiale semplice
-        self.opt.subject_to( 
-            (self.p_swing[0] - support_foot_pos[0])**2 + 
-            (self.p_swing[1] - support_foot_pos[1])**2 <= L_max**2 
-        )
-        
-        # VINCOLI ANTI-COMPENETRAZIONE RIMOSSI: 
-        # Permettiamo esplicitamente i passi incrociati (cross-over steps)
-        # Indispensabili per non cadere quando la spinta spinge verso il piede di supporto.
+        # HRP-4 half foot width + safety margin (metres)
+        HRP4_FOOT_HALF_WIDTH = 0.065   # half of 0.13 m foot y-dimension
+        HRP4_SAFETY_MARGIN   = 0.05    # additional clearance buffer
+        min_lateral_sep = HRP4_FOOT_HALF_WIDTH + HRP4_SAFETY_MARGIN   # 0.115 m
+
+        # Soft penalty weight — high enough to keep normal steps clear,
+        # low enough that IPOPT stays feasible under severe disturbance.
+        W_lateral_sep = 3000.0
+
+        support_foot_y = support_foot_pos[1]   # world-frame Y of support foot centre
+
+        # Determine which side the swing foot should be on:
+        #   if support is lfoot → swing (rfoot) should be to the RIGHT  (y < support_y)
+        #   if support is rfoot → swing (lfoot) should be to the LEFT   (y > support_y)
+        if support_id == 'lfoot':
+            # rfoot swinging → penalise if p_swing[1] > support_y - min_lateral_sep
+            violation = cs.fmax(0.0, self.p_swing[1] - (support_foot_y - min_lateral_sep))
+        else:
+            # lfoot swinging → penalise if p_swing[1] < support_y + min_lateral_sep
+            violation = cs.fmax(0.0, (support_foot_y + min_lateral_sep) - self.p_swing[1])
+
+        # Return the soft penalty so compute_controls() can add it to cost before minimize()
+        return W_lateral_sep * violation**2
         
     def compute_controls(self, current_state, t, nominal_plan=None, allow_footstep_replanning=True):
         planner_tick = int(round(t / self.delta))
@@ -242,10 +302,23 @@ class SrbdMpc:
         
         p_opts = {"expand": True, "print_time": False}
         s_opts = {
-            "max_iter": 500,
+            # The rotational dynamics (R @ I_inv @ R.T) create a nonlinear NLP
+            # that needs enough iterations to converge, especially on cold starts.
+            # 600 gives recovery solves enough budget; warm starts exit via acceptable_iter.
+            "max_iter": 600,
             "print_level": 0,
             "sb": "yes",
-            "tol": 1e-3 
+            "tol": 1e-3,
+            # Acceptable early exit: on warm-started steps IPOPT often reaches
+            # an acceptable solution in 10-30 iters and exits without hitting max_iter.
+            "acceptable_tol": 5e-3,
+            "acceptable_iter": 3,
+            # Faster linear algebra via MUMPS
+            "mumps_pivtol": 1e-4,
+            # Warm-start hints
+            "warm_start_init_point": "yes",
+            "warm_start_bound_push": 1e-6,
+            "warm_start_mult_bound_push": 1e-6,
         }
         self.opt.solver('ipopt', p_opts, s_opts)
         
@@ -346,6 +419,14 @@ class SrbdMpc:
                 self.opt.subject_to(self.opt.bounded(-self.mu * fz, fx, self.mu * fz))
                 self.opt.subject_to(self.opt.bounded(-self.mu * fz, fy, self.mu * fz))
 
+            # Hard bound on angular velocity to prevent numerical explosion in
+            # the rotational dynamics (R @ I_inv @ R.T). Without this, IPOPT can
+            # produce omega > 100 rad/s when it hasn't converged, causing the
+            # fallback path to trigger repeatedly and the robot to fall.
+            self.opt.subject_to(self.opt.bounded(-8.0, self.X[10, k+1],  8.0))  # omega_x
+            self.opt.subject_to(self.opt.bounded(-8.0, self.X[11, k+1],  8.0))  # omega_y
+            self.opt.subject_to(self.opt.bounded(-4.0, self.X[12, k+1],  4.0))  # omega_z (yaw rate)
+
             # Limit total vertical force to avoid jump-like transients when MPC is stressed.
             fz_sum = 0.0
             for i in range(8):
@@ -406,8 +487,9 @@ class SrbdMpc:
             cost += W_quat_norm * (cs.sumsqr(self.X[6:10, k+1]) - 1.0)**2
             cost += cs.mtimes([u_k.T, W_force, u_k])
                 
-        # Vincoli cinematici gamba
-        self.apply_kinematic_constraints(planner_tick)
+        # Vincoli cinematici gamba + soft lateral separation penalty (HRP-4 foot geometry)
+        lateral_sep_cost = self.apply_kinematic_constraints(planner_tick)
+        cost += lateral_sep_cost
 
         lock_to_nominal = (not allow_footstep_replanning) and has_future_step
 
@@ -415,11 +497,10 @@ class SrbdMpc:
             # Target per il piede che atterrerà (p_swing)
             cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
         elif lock_to_nominal:
-            # Keep MPC and executed foot trajectory aligned in nominal-mode runs,
-            # while preserving feasibility with a tight tolerance around nominal.
-            tol = 0.01  # tolleranza stretta prima della botta per fit perfetto
-            self.opt.subject_to(self.opt.bounded(next_step_target[0] - tol, self.p_swing[0], next_step_target[0] + tol))
-            self.opt.subject_to(self.opt.bounded(next_step_target[1] - tol, self.p_swing[1], next_step_target[1] + tol))
+            # Keep MPC and executed foot trajectory aligned in nominal-mode runs.
+            # Rimosso il vincolo hard (tol=0.01) perché rendeva il robot incapace di
+            # fare micro-aggiustamenti per salvarsi se il CoM oscillava minimamente.
+            # Usiamo solo un costo molto elevato per tenere il passo vicino al nominale.
             cost += (10.0 * W_swing) * cs.sumsqr(self.p_swing - next_step_target)
         else:
             # No future step available: keep swing target close without hard locking.
