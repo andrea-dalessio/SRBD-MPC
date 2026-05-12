@@ -21,13 +21,13 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.params = {
             'g': 9.81,
             'foot_size': 0.1,
-            'step_height': 0.05,
-            'ss_duration': 70,
-            'ds_duration': 30,
+            'step_height': 0.07,        # slightly higher lift = more natural gait
+            'ss_duration': 60,          # 0.6 s swing (was 70=0.7 s — too slow)
+            'ds_duration': 20,          # 0.2 s double support (was 30 — too slow)
             'world_time_step': world.getTimeStep(),
             'first_swing': 'rfoot',
             'µ': 0.5,
-            'N': 50, # Reduced horizon for testing speed maybe, original 100
+            'N': 50,                    # horizon 50 steps @ 0.01 s = 0.5 s lookahead
             'dof': self.hrp4.getNumDofs(),
             'mass': self.hrp4.getMass()
         }
@@ -145,7 +145,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.r_knee_p_idx = self.hrp4.getDof('R_KNEE_P').getIndexInSkeleton()
 
         # initialize footstep planner
-        reference = [(0.1, 0., 0.2)] * 5 + [(0.1, 0., -0.1)] * 10 + [(0.1, 0., 0.)] * 10
+        reference = [(0.1, 0., 0.)] * 25
         self.footstep_planner = footstep_planner.FootstepPlanner(
             reference,
             self.initial['lfoot']['pos'],
@@ -170,19 +170,29 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         # record initial plan
         self.initial_plan = copy.deepcopy(self.footstep_planner.plan)
         self.nominal_plan = copy.deepcopy(self.footstep_planner.plan)
-        self.post_impact_plan = None
+        
+        # initialize actual steps tracking
+        self.actual_footsteps = []
+        for i in range(self.params['initial_stationary_steps']):
+            if i < len(self.initial_plan):
+                foot_id = self.initial_plan[i]['foot_id']
+                self.actual_footsteps.append({
+                    'foot_id': foot_id,
+                    'pos': self.initial[foot_id]['pos'][3:6].copy(),
+                    'step_idx': i
+                })
 
         # initialize logger and plots
         self.logger = Logger(self.initial)
 
         self.shutdown_triggered = False
         self.fall_com_height_threshold = 0.35
-        self.max_consecutive_mpc_failures = 8
+        self.max_consecutive_mpc_failures = 15
         self.mpc_fail_count = 0
         disturbance_enabled = os.environ.get('DISTURBANCE_ENABLED', '1').strip().lower() not in ['0', 'false', 'no']
-        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.85'))
-        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '6.00'))
-        disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '50.0'))
+        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.8'))
+        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '5.95'))
+        disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '100'))
         disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '0').strip().lower() not in ['0', 'false', 'no']
         self.disturbance = {
             'enabled': disturbance_enabled,
@@ -196,9 +206,9 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.replan_min_shift_m = float(os.environ.get('REPLAN_MIN_SHIFT_M', '0.005'))
         self.replan_blend_alpha = float(os.environ.get('REPLAN_BLEND_ALPHA', '1.0'))
         self.replan_max_delta_x_m = float(os.environ.get('REPLAN_MAX_DELTA_X_M', '0.25'))
-        self.replan_max_delta_y_m = float(os.environ.get('REPLAN_MAX_DELTA_Y_M', '0.25'))
-        self.replan_max_step_radius_m = float(os.environ.get('REPLAN_MAX_STEP_RADIUS_M', '0.34'))
-        self.replan_min_lateral_clearance_m = float(os.environ.get('REPLAN_MIN_LATERAL_CLEARANCE_M', '0.12'))
+        self.replan_max_delta_y_m = float(os.environ.get('REPLAN_MAX_DELTA_Y_M', '0.30'))
+        self.replan_max_step_radius_m = float(os.environ.get('REPLAN_MAX_STEP_RADIUS_M', '0.35'))
+        self.replan_min_lateral_clearance_m = float(os.environ.get('REPLAN_MIN_LATERAL_CLEARANCE_M', '0.16'))
         self.replan_max_propagation_shift_m = float(os.environ.get('REPLAN_MAX_PROPAGATION_SHIFT_M', '2.0'))
         self.disturbance_seen = False
         print(f"[CONFIG] disturbance_enabled={self.disturbance['enabled']} start={self.disturbance['start']:.2f}s end={self.disturbance['end']:.2f}s mag={self.disturbance['magnitude']:.1f}N")
@@ -250,17 +260,18 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         else:
             print("Mean CoM tracking error: n/a (no valid samples)")
 
-    # Whenever the program reaches termination conditions (either falls, OSQP or IPOPT fails or actually
-    # completes the simulation) the program logs all the results and outputs them as graphs in the folder "plots"
+    
     def _shutdown_with_plots(self, reason, exit_code=1):
         if self.shutdown_triggered:
             return
         self.shutdown_triggered = True
         print(f"\n*** TERMINAZIONE ANTICIPATA *** {reason}")
         self._print_run_report(reason)
-        if self.post_impact_plan is None:
-            self.post_impact_plan = copy.deepcopy(self.footstep_planner.plan)
-        self.logger.log_footsteps(self.initial_plan, self.post_impact_plan)
+        self.logger.log_footsteps(
+            self.initial_plan,
+            getattr(self, 'post_impact_plan', None) or copy.deepcopy(self.footstep_planner.plan),
+            getattr(self, 'actual_footsteps', [])
+        )
 
         save_dir = None
         if self.save_plots_as_images:
@@ -306,7 +317,21 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
     def _is_recovery_mode_active(self):
         if not self.disturbance['enabled']:
             return False
-        return self.disturbance['start'] <= self.time <= (self.disturbance['end'] + self.wbc_recovery_duration)
+        # Time-window trigger: active during push + wbc_recovery_duration seconds after
+        in_window = self.disturbance['start'] <= self.time <= (self.disturbance['end'] + self.wbc_recovery_duration)
+        # Velocity-based trigger: stay active while lateral CoM velocity > 0.35 m/s,
+        # so the robot keeps replanning even if the time window has elapsed but it is
+        # still visibly off-balance.
+        vel_triggered = False
+        if self.disturbance_seen and hasattr(self, 'current') and self.current is not None:
+            try:
+                com_vel_xy = np.array(self.current['com']['vel'][0:2], dtype=float)
+                fwd = self._get_walking_direction_xy(int(round(self.time / self.params['world_time_step'])))
+                lat_vel = com_vel_xy - np.dot(com_vel_xy, fwd) * fwd
+                vel_triggered = float(np.linalg.norm(lat_vel)) > 0.35
+            except Exception:
+                pass
+        return in_window or vel_triggered
 
     # The robot receives a lateral push when in "ss" phase, 5 seconds in. Total impulse = 7.5 Ns.
     def _apply_lateral_disturbance(self, planner_tick):
@@ -407,29 +432,47 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
 
         support_step = self.footstep_planner.plan[current_step_idx]
         support_xy = np.array(support_step['pos'][0:2], dtype=float)
-        nominal_xy = np.array(self.nominal_plan[current_step_idx + 1]['pos'][0:2], dtype=float)
+        # Use the CURRENT planner's target (which includes any recovery shifts) instead of the unshifted nominal plan
+        nominal_xy = np.array(self.footstep_planner.plan[current_step_idx + 1]['pos'][0:2], dtype=float)
         candidate_xy = np.array(opt_p_swing[:2], dtype=float)
 
         alpha = np.clip(self.replan_blend_alpha, 0.0, 1.0)
         candidate_xy = (1.0 - alpha) * nominal_xy + alpha * candidate_xy
 
+        # 1. Apply rectangular delta bounds
         delta = candidate_xy - nominal_xy
         delta[0] = np.clip(delta[0], -self.replan_max_delta_x_m, self.replan_max_delta_x_m)
         delta[1] = np.clip(delta[1], -self.replan_max_delta_y_m, self.replan_max_delta_y_m)
         candidate_xy = nominal_xy + delta
 
+        # 2. Limit maximum radius to physically safe workspace (prevents kinematic singularity)
         step_vec = candidate_xy - support_xy
         step_norm = np.linalg.norm(step_vec)
         if step_norm > self.replan_max_step_radius_m and step_norm > 1e-9:
             candidate_xy = support_xy + (self.replan_max_step_radius_m / step_norm) * step_vec
 
-        # RIMOZIONE LIMITI LATERALI ANTI-COMPENETRAZIONE:
-        # Come nell'MPC, permettiamo matematicamente passi incrociati se necessari per recuperare equilibrio.
-        # support_id = support_step['foot_id']
-        # if support_id == 'lfoot':
-        #     candidate_xy[1] = min(candidate_xy[1], support_xy[1] - self.replan_min_lateral_clearance_m)
-        # else:
-        #     candidate_xy[1] = max(candidate_xy[1], support_xy[1] + self.replan_min_lateral_clearance_m)
+        # 3. DIVIETO ASSOLUTO DI INCROCIO E MANTENIMENTO CLEARANCE
+        # We do this AFTER radial scaling to ensure the gap is strictly preserved.
+        support_id = support_step['foot_id']
+        dy = candidate_xy[1] - support_xy[1]
+        
+        # PROIBIAMO L'INCROCIO (Cross-over step).
+        # Se muove il piede destro (support_id='lfoot'), il destro DEVE stare a destra (dy <= -0.16).
+        # Se muove il piede sinistro (support_id='rfoot'), il sinistro DEVE stare a sinistra (dy >= 0.16).
+        if support_id == 'lfoot': # rfoot is swinging
+            required_dy = min(dy, -self.replan_min_lateral_clearance_m)
+        else: # rfoot is support, lfoot is swinging
+            required_dy = max(dy, self.replan_min_lateral_clearance_m)
+
+        if dy != required_dy:
+            candidate_xy[1] = support_xy[1] + required_dy
+            # If fixing the lateral gap pushed us outside the safe radius, we must shrink the forward step
+            # instead of compromising the lateral clearance.
+            new_step_vec = candidate_xy - support_xy
+            if np.linalg.norm(new_step_vec) > self.replan_max_step_radius_m:
+                # Math: dx^2 + dy^2 = R^2 => dx = sqrt(R^2 - dy^2)
+                max_dx = np.sqrt(max(0, self.replan_max_step_radius_m**2 - required_dy**2))
+                candidate_xy[0] = support_xy[0] + np.sign(new_step_vec[0]) * max_dx
 
         return candidate_xy
         
@@ -484,13 +527,18 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             print(self.current['inertia'])
             print("--------------------")
 
-        if self.time > 26.0:
-            self._shutdown_with_plots("Simulazione completata (26s)", exit_code=0)
+        # Stop when the robot completes all steps: last step index reached + double support
+        current_step_idx_now = self.footstep_planner.get_step_index_at_time(planner_tick)
+        current_phase_now    = self.footstep_planner.get_phase_at_time(planner_tick)
+        total_steps = len(self.initial_plan)
+        if current_step_idx_now is not None and current_step_idx_now >= total_steps - 1 and current_phase_now == 'ds':
+            self._shutdown_with_plots(
+                f"Simulazione completata: step {current_step_idx_now + 1}/{total_steps} eseguito",
+                exit_code=0
+            )
             return
 
-        # Record post impact plan roughly 1s after impact
-        if self.time > 6.0 and self.post_impact_plan is None:
-            self.post_impact_plan = copy.deepcopy(self.footstep_planner.plan)
+
 
         # Apply the disturbance (push)
         self._apply_lateral_disturbance(planner_tick)
@@ -504,11 +552,18 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             current_step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
             current_phase = self.footstep_planner.get_phase_at_time(planner_tick)
             allow_footstep_replanning = self._should_replan_footstep(current_phase, current_step_idx)
+            # Provide the unshifted nominal plan only before the disturbance hits (if replan_only_after_disturbance is True)
+            if self.replan_only_after_disturbance and not self.disturbance_seen:
+                mpc_nominal_plan = self.nominal_plan
+            else:
+                # Passing None forces the MPC to use self.footstep_planner.plan, which contains the shifted targets!
+                mpc_nominal_plan = None
+            
             try:
                 _, _, _, opt_p_swing = self.mpc.compute_controls(
                     self.current,
                     self.time,
-                    nominal_plan=self.nominal_plan,
+                    nominal_plan=mpc_nominal_plan,
                     allow_footstep_replanning=allow_footstep_replanning
                 )
             except Exception as exc:
@@ -543,6 +598,29 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         if hasattr(self, 'phase_prev') and self.phase_prev == 'ss' and phase_now == 'ds':
             idx_landed = current_step_idx + 1
             if current_step_idx is not None and idx_landed < len(self.initial_plan):
+                # Record actual landed foot position from DART skeleton in global world frame.
+                # This is more accurate than reading from current[foot]['pos'] (a state estimate)
+                # because getTransform() queries the physics engine's ground-truth kinematics.
+                try:
+                    lxyz = self.lsole.getTransform(
+                        withRespectTo=dart.dynamics.Frame.World(),
+                        inCoordinatesOf=dart.dynamics.Frame.World()).translation()
+                    rxyz = self.rsole.getTransform(
+                        withRespectTo=dart.dynamics.Frame.World(),
+                        inCoordinatesOf=dart.dynamics.Frame.World()).translation()
+                    # Identify which foot just landed (it is the swing foot of the previous step)
+                    prev_support_id = self.footstep_planner.plan[current_step_idx]['foot_id']
+                    landed_foot_id  = 'lfoot' if prev_support_id == 'rfoot' else 'rfoot'
+                    self.actual_footsteps.append({
+                        'time':        float(self.time),
+                        'step_idx':    idx_landed,
+                        'landed_foot': landed_foot_id,
+                        'lfoot':       list(lxyz),
+                        'rfoot':       list(rxyz),
+                    })
+                except Exception:
+                    pass
+
                 # Calcoliamo lo shift TOTALE rispetto al piano ORIGINALE (initial_plan)
                 final_pos = self.footstep_planner.plan[idx_landed]['pos'][:2]
                 orig_pos = self.initial_plan[idx_landed]['pos'][:2]
@@ -553,21 +631,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 if shift_norm > self.replan_max_propagation_shift_m and shift_norm > 1e-9:
                     total_shift = (self.replan_max_propagation_shift_m / shift_norm) * total_shift
                 
-                replan_active = (not self.replan_only_after_disturbance) or self.disturbance_seen
-                if self.enable_footstep_replanning and replan_active:
-                    recovery_rate = 0.7
-                    
-                    for i in range(idx_landed + 1, len(self.initial_plan)):
-                        k = i - idx_landed
-                        # Calcoliamo lo shift residuo da applicare alla posizione originale
-                        decayed_shift = total_shift * (recovery_rate ** k)
-                        
-                        # Ripristiniamo la posizione partendo da quella INIZIALE + lo shift residuo
-                        self.nominal_plan[i]['pos'][0] = self.initial_plan[i]['pos'][0] + decayed_shift[0]
-                        self.nominal_plan[i]['pos'][1] = self.initial_plan[i]['pos'][1] + decayed_shift[1]
-                        
-                        self.footstep_planner.plan[i]['pos'][0] = self.nominal_plan[i]['pos'][0]
-                        self.footstep_planner.plan[i]['pos'][1] = self.nominal_plan[i]['pos'][1]
+               
                         
         self.phase_prev = phase_now
 
@@ -661,13 +725,29 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             self._shutdown_with_plots(f"Arresto preventivo WBC: {wbc_msg}")
             return
         
-        # Debug
+        # Debug Prints (every 0.1s = 10 ticks)
         max_tau = np.max(np.abs(commands))
         self.run_metrics['max_tau_nm'] = max(self.run_metrics['max_tau_nm'], float(max_tau))
-        if self.debug_verbose:
-            print(f"Time: {self.time} | Phase: {phase_now} | Swing Foot: {swing_foot_id}")
-            print(f"Coppia max: {max_tau:.1f} Nm")
-            print("-" * 20)
+        
+        if planner_tick % 10 == 0:
+            com_curr = self.current['com']['pos']
+            com_des = self.desired['com']['pos']
+            com_v_curr = self.current['com']['vel']
+            com_v_des = self.desired['com']['vel']
+            chest_y = np.rad2deg(self.current['joint']['pos'][self.chest_y_idx])
+            chest_p = np.rad2deg(self.current['joint']['pos'][self.chest_p_idx])
+            
+            # Print state to terminal
+            print(f"=== t={self.time:.2f}s | Phase={phase_now} | Swing={swing_foot_id} ===")
+            print(f"CoM Pos: CURR=[{com_curr[0]:.3f}, {com_curr[1]:.3f}, {com_curr[2]:.3f}] | DES=[{com_des[0]:.3f}, {com_des[1]:.3f}, {com_des[2]:.3f}]")
+            print(f"CoM Vel: CURR=[{com_v_curr[0]:.3f}, {com_v_curr[1]:.3f}, {com_v_curr[2]:.3f}] | DES=[{com_v_des[0]:.3f}, {com_v_des[1]:.3f}, {com_v_des[2]:.3f}]")
+            print(f"Chest Angles: Yaw={chest_y:.2f}°, Pitch={chest_p:.2f}° | Max Torque: {max_tau:.1f} Nm")
+            
+            # Print actual foot positions
+            p_L = self.current['lfoot']['pos'][3:6]
+            p_R = self.current['rfoot']['pos'][3:6]
+            print(f"Feet: L=[{p_L[0]:.3f}, {p_L[1]:.3f}, {p_L[2]:.3f}] | R=[{p_R[0]:.3f}, {p_R[1]:.3f}, {p_R[2]:.3f}]")
+            print("-" * 60)
         
         # 7. Apply torques
         for i in range(self.params['dof'] - 6):
@@ -765,7 +845,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             # fallback: approximate CoP as projection of CoM on ground (or previous)
             cop = np.array([com_position[0], com_position[1], 0.0])
 
-        # Expose both for logging/diagnostics: 'zmp' -> robust CoP, 'zmp_raw' -> original estimate
+        
         zmp = cop
         self.current_zmp_raw = zmp_raw
         
@@ -827,7 +907,10 @@ if __name__ == "__main__":
 
     # create world node and add it to viewer
     viewer = dart.gui.osg.Viewer()
-    node.setTargetRealTimeFactor(10) 
+    # Real-time factor: 10 = render as fast as the MPC allows (original setting).
+    # The sim will not slow down for wall-clock. each frame advances as quickly
+    # as compute permits, so the full 25-step run finishes much faster on screen.
+    node.setTargetRealTimeFactor(10)
     viewer.addWorldNode(node)
 
     #viewer.setUpViewInWindow(0, 0, 1920, 1080)
@@ -837,7 +920,9 @@ if __name__ == "__main__":
                                  [0.,  0., 1. ])
     viewer.run()
     
-    if node.post_impact_plan is None:
-        node.post_impact_plan = copy.deepcopy(node.footstep_planner.plan)
-    node.logger.log_footsteps(node.initial_plan, node.post_impact_plan)
+    node.logger.log_footsteps(
+        node.initial_plan,
+        getattr(node, 'post_impact_plan', None) or copy.deepcopy(node.footstep_planner.plan),
+        getattr(node, 'actual_footsteps', [])
+    )
     node.logger.show_all_plots()
