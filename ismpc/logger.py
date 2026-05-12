@@ -1,5 +1,6 @@
 import numpy as np
 from matplotlib import pyplot as plt
+import matplotlib.patches as patches
 import os
 
 class Logger():
@@ -15,9 +16,10 @@ class Logger():
         self.initial_plan = None
         self.post_impact_plan = None
 
-    def log_footsteps(self, initial_plan, post_impact_plan):
+    def log_footsteps(self, initial_plan, post_impact_plan, actual_footsteps=None):
         self.initial_plan = initial_plan
-        self.post_impact_plan = post_impact_plan
+        self.actual_plan = post_impact_plan          # planned/replanned steps for the map
+        self.actual_footsteps = actual_footsteps if actual_footsteps is not None else []
 
     def log_disturbance(self, time_stamp, force_world, forward_xy, com_xy):
         self.log['disturbances'].append({
@@ -150,39 +152,85 @@ class Logger():
 
             initial_labels_done = {'lfoot': False, 'rfoot': False}
 
+            # Footprint physical dimensions (approximate)
+            foot_l = 0.10
+            foot_w = 0.10
+
             for i, step in enumerate(self.initial_plan):
                 x, y, z = step['pos']
+                
+                # We need the yaw angle if available to rotate the rectangle properly.
+                # However, for simplicity and since walking is mostly forward here, we just use axis-aligned boxes 
+                # or extract yaw from step['ang'] if present.
+                yaw = step.get('ang', [0, 0, 0])[2]
+                
                 color = 'tab:blue' if step['foot_id'] == 'lfoot' else 'tab:green'
                 foot_lbl = 'Left Footsteps (nominal)' if step['foot_id'] == 'lfoot' else 'Right Footsteps (nominal)'
-                ax1.scatter(
-                    x,
-                    y,
-                    s=520,
-                    marker='s',
-                    color=color,
+                
+                # Calculate bottom-left corner from center
+                bl_x = x - (foot_l / 2) * np.cos(yaw) + (foot_w / 2) * np.sin(yaw)
+                bl_y = y - (foot_l / 2) * np.sin(yaw) - (foot_w / 2) * np.cos(yaw)
+
+                rect = patches.Rectangle(
+                    (bl_x, bl_y), foot_l, foot_w,
+                    angle=np.degrees(yaw),
+                    facecolor=color,
                     alpha=0.22,
-                    edgecolors='none',
+                    edgecolor='none',
                     label=foot_lbl if not initial_labels_done[step['foot_id']] else None
                 )
+                ax1.add_patch(rect)
                 initial_labels_done[step['foot_id']] = True
                 ax1.text(x, y, str(i), color=color, fontsize=12, ha='center', va='center', fontweight='bold')
 
-            if hasattr(self, 'post_impact_plan') and self.post_impact_plan is not None:
-                replanned_label_done = False
-                for i, step in enumerate(self.post_impact_plan):
+            if hasattr(self, 'actual_plan') and self.actual_plan is not None:
+                actual_label_done = False
+                for step in self.actual_plan:
+                    i = step.get('step_idx', '')
                     x, y, z = step['pos']
-                    ax1.scatter(
-                        x,
-                        y,
-                        s=520,
-                        marker='s',
-                        facecolors='none',
-                        edgecolors='red',
-                        linewidths=2.2,
-                        label='Footsteps (replanned)' if not replanned_label_done else None
+                    yaw = step.get('ang', [0, 0, 0])[2]
+                    bl_x = x - (foot_l / 2) * np.cos(yaw) + (foot_w / 2) * np.sin(yaw)
+                    bl_y = y - (foot_l / 2) * np.sin(yaw) - (foot_w / 2) * np.cos(yaw)
+                    rect = patches.Rectangle(
+                        (bl_x, bl_y), foot_l, foot_w,
+                        angle=np.degrees(yaw),
+                        fill=False,
+                        edgecolor='darkorange',
+                        linewidth=2.2,
+                        label='Footsteps (planned/replanned)' if not actual_label_done else None
                     )
-                    replanned_label_done = True
-                    ax1.text(x, y + 0.035, f"{i}'", color='red', fontsize=11, ha='center', va='center', fontweight='bold')
+                    ax1.add_patch(rect)
+                    actual_label_done = True
+                    ax1.text(x, y + 0.035, f"{i}p", color='darkorange', fontsize=10,
+                             ha='center', va='center', fontweight='bold')
+
+            # Actual executed footsteps from DART skeleton (global world-frame coordinates)
+            # These come from getTransform() queries on l_sole / r_sole — ground-truth kinematics.
+            if hasattr(self, 'actual_footsteps') and self.actual_footsteps:
+                dart_label_done = False
+                for contact in self.actual_footsteps:
+                    landed = contact.get('landed_foot')
+                    step_lbl = str(contact.get('step_idx', '?'))
+                    feet_to_show = [landed] if landed in ('lfoot', 'rfoot') else ['lfoot', 'rfoot']
+                    for foot in feet_to_show:
+                        pos = contact.get(foot)
+                        if pos is None:
+                            continue
+                        fx, fy = float(pos[0]), float(pos[1])
+                        bl_x = fx - foot_l / 2
+                        bl_y = fy - foot_w / 2
+                        rect = patches.Rectangle(
+                            (bl_x, bl_y), foot_l, foot_w,
+                            angle=0.0,
+                            fill=False,
+                            edgecolor='red',
+                            linewidth=2.2,
+                            label='Footsteps (actual — DART skeleton)' if not dart_label_done else None
+                        )
+                        ax1.add_patch(rect)
+                        dart_label_done = True
+                        ax1.text(fx, fy + 0.035, step_lbl, color='red', fontsize=11,
+                                 ha='center', va='center', fontweight='bold')
 
             ax1.plot(com_cur[:, 0], com_cur[:, 1], 'k-', linewidth=2.3, label='CoM Current')
             ax1.plot(com_des[:, 0], com_des[:, 1], 'k--', linewidth=1.7, alpha=0.9, label='CoM Desired')
