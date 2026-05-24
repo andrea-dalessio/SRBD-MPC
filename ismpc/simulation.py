@@ -190,10 +190,10 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.max_consecutive_mpc_failures = 15
         self.mpc_fail_count = 0
         disturbance_enabled = os.environ.get('DISTURBANCE_ENABLED', '1').strip().lower() not in ['0', 'false', 'no']
-        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '5.8'))
-        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '5.95'))
-        disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '100'))
-        disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '0').strip().lower() not in ['0', 'false', 'no']
+        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '6.55')) #7 for DS, 6.55 for SS
+        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '6.70')) #7.15 for DS, 6.70 for SS
+        disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '50.0'))
+        disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '1').strip().lower() not in ['0', 'false', 'no']
         self.disturbance = {
             'enabled': disturbance_enabled,
             'start': disturbance_start,
@@ -658,9 +658,17 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             swing_foot_id = 'lfoot' if support_foot_id == 'rfoot' else 'rfoot'
 
         # 3. Update desired state based on MPC output
-        self.desired['com']['pos'] = target_state['com']['pos']
-        self.desired['com']['vel'] = target_state['com']['vel']
-        self.desired['com']['acc'] = target_state['com']['acc']
+        self.desired['com']['pos'] = target_state['com']['pos'].copy()
+        if not self._is_recovery_mode_active():
+            self.desired['com']['pos'][2] = self.initial['com']['pos'][2]
+            
+        self.desired['com']['vel'] = target_state['com']['vel'].copy()
+        if not self._is_recovery_mode_active():
+            self.desired['com']['vel'][2] = 0.0
+            
+        self.desired['com']['acc'] = target_state['com']['acc'].copy()
+        if not self._is_recovery_mode_active():
+            self.desired['com']['acc'][2] = 0.0
         com_err = np.linalg.norm(self.desired['com']['pos'] - self.current['com']['pos'])
         if np.isfinite(com_err):
             self.run_metrics['com_err_sum_m'] += float(com_err)
