@@ -26,7 +26,7 @@ class SrbdMpc:
         self.fz_sum_min_factor_ss = float(os.environ.get('MPC_FZ_SUM_MIN_FACTOR_SS', '0.60'))
         self.fz_sum_max_factor_ss = float(os.environ.get('MPC_FZ_SUM_MAX_FACTOR_SS', '1.50'))
         
-        # Definizione della dinamica f con rotazione dell'inerzia
+        # Dynamics
         self.f = lambda x, u, p_contacts: self._get_dynamics_with_rot_inertia(x, u, p_contacts)
         self.last_X = None
         self.last_U = None
@@ -129,7 +129,7 @@ class SrbdMpc:
 
         I_world_inv = R @ self.I_body_inv @ R.T
         
-        # Ci serve comunque I_world per il momento angolare L
+        # Compute inertia in world frame to get angular momentum
         I_world = R @ self.I @ R.T
         L = I_world @ omega
 
@@ -143,7 +143,6 @@ class SrbdMpc:
         )
 
     def quat_to_rot(self, q):
-        """Converte un quaternione [w, x, y, z] in matrice di rotazione 3x3 usando CasADi."""
         w, x, y, z = q[0], q[1], q[2], q[3]
         
         R = cs.vertcat(
@@ -188,7 +187,7 @@ class SrbdMpc:
         #   Foot collision box : 0.25 m (x) x 0.13 m (y)
         #   Hip lateral offset : ±0.0875 m  →  nominal foot centre-to-centre = 0.175 m
         #
-        # Soft lateral-separation constraint (promised feature):
+        # Soft lateral-separation constraint:
         #   We enforce a minimum lateral clearance between the swing foot target and the
         #   support foot centre using a SOFT quadratic penalty rather than a hard constraint.
         #   This keeps IPOPT feasible under large disturbances (hard constraints would cause
@@ -273,15 +272,14 @@ class SrbdMpc:
                 contact = self.footstep_planner.plan[step_idx]['foot_id']
             return optimal_controls, target_state, contact, self.last_p_swing
 
-        #  Inizializzazione Problema di Ottimizzazione
+        # Optimization problem setup
         self.opt = cs.Opti()
         self.X = self.opt.variable(13, self.N + 1) 
         self.U = self.opt.variable(24, self.N)     
         self.p_swing = self.opt.variable(2)
-
-        # INIZIALIZZAZIONE E WARM START 
+ 
         if getattr(self, 'last_X', None) is not None:
-            # Shift buffer di 5 ticks (frequenza simulatore 100Hz / MPC 20Hz)
+            # Shift buffer of 5 ticks (simulator frequency 100Hz / MPC 20Hz) to warm start the MPC
             shift = 5
             if self.N > shift:
                 X_guess = np.hstack((self.last_X[:, shift:], np.tile(self.last_X[:, -1:], (1, shift))))
@@ -333,7 +331,7 @@ class SrbdMpc:
         
         current_support = self.footstep_planner.plan[current_step_index]['foot_id']
         
-        #  TUNING PESI 
+        # Weights 
         cost = 0.0
         W_com_z = 5000.0
         W_com_x = 100.0
@@ -351,7 +349,7 @@ class SrbdMpc:
 
         h_ref = self.initial['com']['pos'][2] 
         
-        # --- MAIN LOOP ---
+        # Main loop
         for k in range(self.N): 
             t_k = t + k * self.delta
             planner_tick_k = planner_tick + k
@@ -359,20 +357,21 @@ class SrbdMpc:
             phase = self.footstep_planner.get_phase_at_time(planner_tick_k)
             support_foot = self.footstep_planner.plan[future_step_index]['foot_id']
             
-            # --- UNIVERSAL HORIZON EVALUATOR ---
+            # Horizon evaluator (Use the nominal plan if replanner hasn't triggered)
             if nominal_plan is not None:
                 plan_to_use = nominal_plan
             else:
                 plan_to_use = self.footstep_planner.plan
 
-            # Trova l'ultimo step in cui LFOOT era il piede di swing
+            # Find the last step in which LFOOT was the swing foot
             last_swing_l = -1
             for j in range(current_step_index, future_step_index + 1):
                 j_valid = min(j, len(plan_to_use)-1)
-                # se il supporto è rfoot, LFOOT è lo swing
+                # if support is rfoot, LFOOT is the swing foot
                 if plan_to_use[j_valid]['foot_id'] == 'rfoot': 
                     last_swing_l = j_valid
             
+            # If no swing foot is found, use the current state
             if last_swing_l == -1:
                 p_lfoot_k = current_state['lfoot']['pos'][3:5]
                 yaw_l_k   = current_state['lfoot']['pos'][2]
@@ -383,11 +382,11 @@ class SrbdMpc:
                 p_lfoot_k = plan_to_use[last_swing_l]['pos'][0:2]
                 yaw_l_k   = plan_to_use[last_swing_l]['ang'][2]
 
-            # Trova l'ultimo step in cui RFOOT era il piede di swing
+            # Find the last step in which RFOOT was the swing foot
             last_swing_r = -1
             for j in range(current_step_index, future_step_index + 1):
                 j_valid = min(j, len(plan_to_use)-1)
-                # se il supporto è lfoot, RFOOT è lo swing
+                # if support is lfoot, RFOOT is the swing foot
                 if plan_to_use[j_valid]['foot_id'] == 'lfoot': 
                     last_swing_r = j_valid
 
@@ -400,15 +399,14 @@ class SrbdMpc:
             else:
                 p_rfoot_k = plan_to_use[last_swing_r]['pos'][0:2]
                 yaw_r_k   = plan_to_use[last_swing_r]['ang'][2]
-            # --- END UNIVERSAL HORIZON EVALUATOR ---
 
             p_contacts = self.generate_contact_points(p_lfoot_k, p_rfoot_k, yaw_l_k, yaw_r_k, 0.0)
 
-            # DINAMICA E VINCOLI FISICI 
+            # Dynamics and physical constraints
             x_k = self.X[:, k]
             u_k = self.U[:, k]
             
-            # Integrazione dinamica 
+            # Dynamic integration (Euler)
             x_next = x_k + self.delta * self.f(x_k, u_k, p_contacts)
             self.opt.subject_to(self.X[:, k + 1] == x_next)
             
@@ -419,7 +417,7 @@ class SrbdMpc:
                 fy = self.U[i*3 + 1, k]
                 fz = self.U[i*3 + 2, k]
                 
-                # Forza Z minima a 0.1 per stabilità numerica
+                # Minimum Z force for numerical stability
                 self.opt.subject_to(self.opt.bounded(0.0, fz, 500.0)) 
                 self.opt.subject_to(self.opt.bounded(-self.mu * fz, fx, self.mu * fz))
                 self.opt.subject_to(self.opt.bounded(-self.mu * fz, fy, self.mu * fz))
@@ -457,13 +455,12 @@ class SrbdMpc:
                     self.opt.subject_to(self.opt.bounded(-1e-4, self.U[12:24, k], 1e-4))
 
             
-            # Cost function
-            # Altezza CoM
+            # COST FUNCTIONS
+            # COM Height
             cost += W_com_z * (self.X[2, k + 1] - h_ref)**2
             
-            # Target XY del CoM
-            # Lo spostiamo dolcemente verso il piede d'appoggio per annullare la gravità,
-            # ma con un peso W_com_y più basso (20) per non strattonare.
+            # CoM Target XY
+            # Move smoothly towards the support foot to cancel gravity
             if phase == 'ds':
                 com_xy_target = (p_lfoot_k + p_rfoot_k) / 2.0
             else:
@@ -475,18 +472,18 @@ class SrbdMpc:
             cost += W_com_x * (self.X[0, k+1] - com_xy_target[0])**2
             cost += W_com_y * (self.X[1, k+1] - com_xy_target[1])**2
             
-            # Regolarizzazioni (Velocità, Orientamento, Omega)
+            # Regularization (Velocity, Orientation, Omega)
             cost += cs.mtimes([(self.X[3:6, k+1]).T, W_vel, self.X[3:6, k+1]])
             
-            # Tracking dell'orientamento Yaw dinamico lungo la traiettoria
+            # Dynamic yaw orientation tracking along the trajectory
             yaw_ref = (yaw_l_k + yaw_r_k) / 2.0
             q_ref_w = cs.cos(yaw_ref / 2.0)
             q_ref_z = cs.sin(yaw_ref / 2.0)
             
-            # Penalizzazioni indipendenti: Roll e Pitch (fermi), Yaw (segue le orme)
-            # Calcoliamo l'errore del quaternione q_err = q_ref* * q
-            # q_err_x e q_err_y rappresentano l'errore di roll e pitch nel body frame
-            # q_err_z rappresenta l'errore di yaw
+            # Independent penalties: Roll and Pitch (fixed), Yaw (tracks the footsteps)
+            # Calculate quaternion error q_err = q_ref* * q
+            # q_err_x and q_err_y represent the roll and pitch error in the body frame
+            # q_err_z represents the yaw error
             q_err_x = q_ref_w * self.X[7, k+1] - q_ref_z * self.X[8, k+1]
             q_err_y = q_ref_w * self.X[8, k+1] + q_ref_z * self.X[7, k+1]
             q_err_z = q_ref_w * self.X[9, k+1] - q_ref_z * self.X[6, k+1]
@@ -499,20 +496,17 @@ class SrbdMpc:
             cost += W_quat_norm * (cs.sumsqr(self.X[6:10, k+1]) - 1.0)**2
             cost += cs.mtimes([u_k.T, W_force, u_k])
                 
-        # Vincoli cinematici gamba + soft lateral separation penalty (HRP-4 foot geometry)
+        # Leg and soft lateral separation constraint (HRP-4 foot geometry)
         lateral_sep_cost = self.apply_kinematic_constraints(planner_tick)
         cost += lateral_sep_cost
 
         lock_to_nominal = (not allow_footstep_replanning) and has_future_step
 
         if allow_footstep_replanning:
-            # Target per il piede che atterrerà (p_swing)
+            # Target for the foot that will land (p_swing)
             cost += W_swing * cs.sumsqr(self.p_swing - next_step_target)
         elif lock_to_nominal:
             # Keep MPC and executed foot trajectory aligned in nominal-mode runs.
-            # Rimosso il vincolo hard (tol=0.01) perché rendeva il robot incapace di
-            # fare micro-aggiustamenti per salvarsi se il CoM oscillava minimamente.
-            # Usiamo solo un costo molto elevato per tenere il passo vicino al nominale.
             cost += (10.0 * W_swing) * cs.sumsqr(self.p_swing - next_step_target)
         else:
             # No future step available: keep swing target close without hard locking.
@@ -525,7 +519,7 @@ class SrbdMpc:
             self.last_solve_success = True
             self.last_solve_message = ""
             
-            # Salvare per Warm Start e Buffering
+            # Save for Warm Start and Buffering
             self.last_X = sol.value(self.X)
             self.last_U = sol.value(self.U)
             self.last_p_swing = sol.value(self.p_swing)

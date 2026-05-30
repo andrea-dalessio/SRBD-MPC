@@ -302,7 +302,7 @@ class InverseDynamics:
         elif swing_Foot == 'rfoot':
             f_c_ref[6:] *= 0.0
 
-        # 4. WEIGHT AND GAIN TUNING (updated for SRBD)
+        # 4. WEIGHT AND GAIN TUNING
         tasks = ['lfoot', 'rfoot', 'com', 'torso', 'base', 'joints']
 
         weights = {'lfoot': 5., 'rfoot': 5., 'com': 50.0, 'torso': 20.0, 'base': 1.0, 'joints': 0.5}

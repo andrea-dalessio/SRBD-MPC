@@ -22,8 +22,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
             'g': 9.81,
             'foot_size': 0.1,
             'step_height': 0.07,        # slightly higher lift = more natural gait
-            'ss_duration': 60,          # 0.6 s swing (was 70=0.7 s — too slow)
-            'ds_duration': 20,          # 0.2 s double support (was 30 — too slow)
+            'ss_duration': 60,          # 0.6 s swing
+            'ds_duration': 20,          # 0.2 s double support
             'world_time_step': world.getTimeStep(),
             'first_swing': 'rfoot',
             'µ': 0.5,
@@ -190,8 +190,8 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.max_consecutive_mpc_failures = 15
         self.mpc_fail_count = 0
         disturbance_enabled = os.environ.get('DISTURBANCE_ENABLED', '1').strip().lower() not in ['0', 'false', 'no']
-        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '6.55')) #7 for DS, 6.55 for SS
-        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '6.70')) #7.15 for DS, 6.70 for SS
+        disturbance_start = float(os.environ.get('DISTURBANCE_START_S', '7.00')) #7 for DS, 6.55 for SS
+        disturbance_end = float(os.environ.get('DISTURBANCE_END_S', '7.15')) #7.15 for DS, 6.70 for SS
         disturbance_magnitude = float(os.environ.get('DISTURBANCE_MAGNITUDE_N', '50.0'))
         disturbance_leftward = os.environ.get('DISTURBANCE_LEFTWARD', '1').strip().lower() not in ['0', 'false', 'no']
         self.disturbance = {
@@ -421,7 +421,7 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         if current_step_idx + 1 >= len(self.footstep_planner.plan):
             return False
         
-        # Abilita il replanning SOLTANTO durante il periodo di instabilità o nel transient dopo la spinta.
+        # Replanner triggered when the robot detects excessive lateral velocity or is unstable ("Am I getting shoved to the side?")
         if self.replan_only_after_disturbance and not self._is_recovery_mode_active():
             return False
         return True
@@ -451,14 +451,12 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         if step_norm > self.replan_max_step_radius_m and step_norm > 1e-9:
             candidate_xy = support_xy + (self.replan_max_step_radius_m / step_norm) * step_vec
 
-        # 3. DIVIETO ASSOLUTO DI INCROCIO E MANTENIMENTO CLEARANCE
+        # 3. STRICT ANTI-CROSSING & CLEARANCE PRESERVATION
         # We do this AFTER radial scaling to ensure the gap is strictly preserved.
         support_id = support_step['foot_id']
         dy = candidate_xy[1] - support_xy[1]
         
-        # PROIBIAMO L'INCROCIO (Cross-over step).
-        # Se muove il piede destro (support_id='lfoot'), il destro DEVE stare a destra (dy <= -0.16).
-        # Se muove il piede sinistro (support_id='rfoot'), il sinistro DEVE stare a sinistra (dy >= 0.16).
+        # FORBID CROSSING
         if support_id == 'lfoot': # rfoot is swinging
             required_dy = min(dy, -self.replan_min_lateral_clearance_m)
         else: # rfoot is support, lfoot is swinging
@@ -590,8 +588,6 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 
             self.mpc_tick_offset = 0
 
-        # After landing, whichever shift was chosen for recovery is propagated to the rest of the footstep plan.
-                # Riconvergenza alla traiettoria originale mediante decay
         current_step_idx = self.footstep_planner.get_step_index_at_time(planner_tick)
         phase_now = self.footstep_planner.get_phase_at_time(planner_tick)
 
@@ -621,12 +617,12 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
                 except Exception:
                     pass
 
-                # Calcoliamo lo shift TOTALE rispetto al piano ORIGINALE (initial_plan)
+                # Calculate TOTAL shift from ORIGINAL plan (initial_plan)
                 final_pos = self.footstep_planner.plan[idx_landed]['pos'][:2]
                 orig_pos = self.initial_plan[idx_landed]['pos'][:2]
                 total_shift = final_pos - orig_pos
 
-                # Limita lo shift massimo per sicurezza
+                # Limit the maximum shift for safety
                 shift_norm = np.linalg.norm(total_shift)
                 if shift_norm > self.replan_max_propagation_shift_m and shift_norm > 1e-9:
                     total_shift = (self.replan_max_propagation_shift_m / shift_norm) * total_shift
@@ -701,8 +697,6 @@ class Hrp4Controller(dart.gui.osg.RealTimeWorldNode):
         self.desired['torso']['acc'] = np.zeros(3)
 
         # 6. WBC computations (Inverse Dynamics)
-        # Disabilitiamo il recovery_mode nel WBC per evitare instabilità (snap) sui gain
-        # come ipotizzato, evitando che il robot cada "dopo" aver superato la botta.
         wbc_recovery_mode = False
         commands, wbc_ok, wbc_msg = self.id_strict.get_joint_torques(
             self.desired,
