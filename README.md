@@ -205,33 +205,16 @@ Different controller configurations are tested under increasing disturbance inte
 
 ---
 
-## 📄 **Documentation**
+## ⚙️ Technologies
 
-The repository includes:
-
-• Complete technical report
-• Presentation material
-• Simulation scripts
-• MPC and WBC implementation files
-• Parameter configurations
-• Disturbance recovery experiments
-• Result plots and footstep maps
-
----
-
-## ⚙️ **Technologies**
-
-• Python
-• CasADi
-• IPOPT
-• DARTpy
-• NumPy
-• Matplotlib
-• Humanoid Robotics
-• Model Predictive Control
-• Whole-Body Control
-• Nonlinear Optimization
-
+| Category             | Tools / Topics                                                  |
+| -------------------- | --------------------------------------------------------------- |
+| Programming          | Python                                                          |
+| Optimization         | CasADi, IPOPT                                                   |
+| Simulation           | DARTpy                                                          |
+| Scientific Computing | NumPy, Matplotlib                                               |
+| Robotics             | Humanoid Robotics, Model Predictive Control, Whole-Body Control |
+| Methods              | Nonlinear Optimization, Inverse Dynamics, Push Recovery         |
 ---
 
 ## 🎯 **Main Contributions**
