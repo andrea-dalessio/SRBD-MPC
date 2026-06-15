@@ -10,20 +10,20 @@ The main objective is to generate stable walking motions while improving robustn
 
 ---
 
-## 🧭 **Control Philosophy**
+## 🧭 Control Philosophy
 
-The architecture follows a hierarchical control structure:
+The architecture follows a **hierarchical control structure**:
 
-• A nominal footstep planner provides the reference gait sequence
-• The SRBD-MPC optimizes CoM motion, torso attitude, GRFs, and swing foot placement
-• A trajectory generator produces smooth swing foot trajectories
-• The Whole-Body Controller converts MPC references into joint accelerations and torques
+* A nominal footstep planner provides the reference gait sequence.
+* The SRBD-MPC optimizes CoM motion, torso attitude, GRFs, and swing foot placement.
+* A trajectory generator produces smooth swing foot trajectories.
+* The Whole-Body Controller converts MPC references into joint accelerations and torques.
 
-The MPC does not rigidly follow the nominal footstep plan. Instead, the next swing foot target is treated as a soft optimization variable, allowing the robot to adapt its foot placement when external disturbances make the original plan dynamically unsafe.
+The MPC does not rigidly follow the nominal footstep plan. Instead, the next swing foot target is treated as a **soft optimization variable**, allowing the robot to adapt its foot placement when external disturbances make the original plan dynamically unsafe.
 
 ---
 
-## 🧠 **SRBD-MPC Layer**
+## 🧠 SRBD-MPC Layer
 
 The humanoid robot is approximated as a **single rigid body** with state:
 
@@ -33,10 +33,10 @@ x = [p^T,\dot{p}^T,q^T,\omega^T]^T \in \mathbb{R}^{13}
 
 where:
 
-• `p` is the CoM position
-• `p_dot` is the CoM linear velocity
-• `q` is the unit quaternion representing torso orientation
-• `omega` is the angular velocity of the base
+* `p` is the CoM position.
+* `p_dot` is the CoM linear velocity.
+* `q` is the unit quaternion representing torso orientation.
+* `omega` is the angular velocity of the base.
 
 The control input is composed of the **Ground Reaction Forces (GRFs)** distributed across the contact vertices of the feet:
 
@@ -44,15 +44,26 @@ The control input is composed of the **Ground Reaction Forces (GRFs)** distribut
 u \in \mathbb{R}^{24}
 ```
 
+The controller uses **4 contact vertices per foot**, with each vertex applying a 3D force.
+
+This multi-contact representation allows the controller to manage:
+
+* Center of Pressure distribution
+* Contact torque generation
+* Friction constraints
+* Unilateral ground contact
+* Push recovery through force redistribution
+
+
 using **4 contact vertices per foot**, each applying a 3D force.
 
 This multi-contact representation allows the controller to manage:
 
-• Center of Pressure distribution
-• Contact torque generation
-• Friction constraints
-• Unilateral ground contact
-• Push recovery through force redistribution
+* Center of Pressure distribution
+* Contact torque generation
+* Friction constraints
+* Unilateral ground contact
+* Push recovery through force redistribution
 
 ---
 
@@ -82,11 +93,11 @@ This ensures that the robot can recover from disturbances without requesting phy
 
 The MPC minimizes a nonlinear objective function composed of several terms:
 
-• **CoM tracking** to maintain vertical stability and guide horizontal progression
-• **Quaternion attitude tracking** to stabilize torso roll, pitch, and yaw
-• **Regularization terms** to smooth CoM velocity, angular velocity, and GRFs
-• **Swing foot cost** to keep the replanned footstep close to the nominal target
-• **Lateral clearance penalty** to avoid leg cross-over and self-collisions
+* **CoM tracking** to maintain vertical stability and guide horizontal progression
+* **Quaternion attitude tracking** to stabilize torso roll, pitch, and yaw
+* **Regularization terms** to smooth CoM velocity, angular velocity, and GRFs
+* **Swing foot cost** to keep the replanned footstep close to the nominal target
+* **Lateral clearance penalty** to avoid leg cross-over and self-collisions
 
 Roll and pitch are strongly penalized to prevent falling, while yaw is tracked more softly to allow natural torso rotation during locomotion and disturbance recovery.
 
@@ -96,13 +107,13 @@ Roll and pitch are strongly penalized to prevent falling, while yaw is tracked m
 
 The optimization problem enforces physical feasibility through several constraints:
 
-• SRBD dynamic consistency
-• Friction cone constraints
-• Unilateral contact constraints
-• GRF bounds
-• Angular velocity limits
-• Step length limits
-• Lateral clearance constraints
+* SRBD dynamic consistency
+* Friction cone constraints
+* Unilateral contact constraints
+* GRF bounds
+* Angular velocity limits
+* Step length limits
+* Lateral clearance constraints
 
 The friction cone approximation is expressed as:
 
@@ -126,9 +137,9 @@ The **Whole-Body Controller (WBC)** acts as a bridge between the reduced-order S
 
 It solves an **inverse dynamics Quadratic Program (QP)** to compute:
 
-• joint accelerations
-• contact forces
-• motor torques
+* joint accelerations
+* contact forces
+* motor torques
 
 The full-body dynamics are imposed as:
 
@@ -138,12 +149,12 @@ M(q)\ddot{q}+h(q,\dot{q})=S^T\tau+J_c^Tf_c
 
 where:
 
-• `M(q)` is the full-body mass matrix
-• `h(q,q_dot)` contains gravity, Coriolis, and centrifugal terms
-• `tau` are the actuated joint torques
-• `f_c` are the contact forces
-• `S` is the selection matrix for actuated joints
-• `J_c` is the contact Jacobian
+* `M(q)` is the full-body mass matrix
+* `h(q,q_dot)` contains gravity, Coriolis, and centrifugal terms
+* `tau` are the actuated joint torques
+* `f_c` are the contact forces
+* `S` is the selection matrix for actuated joints
+* `J_c` is the contact Jacobian
 
 The WBC tracks CoM, torso orientation, swing foot motion, and MPC contact force references while respecting full-body physical constraints.
 
